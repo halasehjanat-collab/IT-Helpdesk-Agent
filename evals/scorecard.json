@@ -1,0 +1,448 @@
+{
+ "summary": {
+  "cases_file": "C:\\Users\\mukab\\OneDrive\\Desktop\\bootcamp\\Agentic-AI-Bootcamp-Students-1\\Final-Mini-Project\\scenario-2-it-helpdesk\\kit\\evals\\cases.sample.jsonl",
+  "runs": 10,
+  "passed": 0,
+  "pass_rate": 0.0,
+  "turn_latency_avg_s": 5.32,
+  "turn_latency_p95_s": 7.04,
+  "cost_usd_reported": null,
+  "by_category": {
+   "clarification": "0/1",
+   "conflict": "0/1",
+   "grounding": "0/1",
+   "guardrail": "0/1",
+   "happy_path": "0/1",
+   "policy_conflict": "0/2",
+   "rejection": "0/1",
+   "tool_failure": "0/1",
+   "unknown": "0/1"
+  },
+  "wall_time_s": 70.8
+ },
+ "results": [
+  {
+   "id": "S2-01",
+   "category": "grounding",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_contains_any",
+     "ok": true,
+     "detail": "wanted one of ['30 minutes', '/unlock']"
+    },
+    {
+     "check": "pending_action",
+     "ok": true,
+     "detail": "expected none, got None"
+    },
+    {
+     "check": "citations_include",
+     "ok": true,
+     "detail": "missing [], got ['KB-006']"
+    },
+    {
+     "check": "citations_exclude",
+     "ok": true,
+     "detail": "must not cite []"
+    },
+    {
+     "check": "max_latency_s",
+     "ok": true,
+     "detail": "slowest turn 5.2s"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "NakhlaID says NID-423 when I try to sign in. What should I do?"
+     },
+     "seconds": 5.18,
+     "status": 200,
+     "reply": "The error code NID-423 means your NakhlaID account is locked due to 5 failed sign-in attempts within 15 minutes.\n\nTo unlock it, you have two options:\n\n1. Wait 30 minutes and the lock will release automatically.\n2. Unlock immediately by going to https://id.nakhla.example/unlock, entering your work email, and approving the NakhlaKey prompt or using a backup code.\n\nIf you forgot your password, you should reset it instead at https://id.nakhla.example/reset, which also unlocks the account.\n\nIf your account keeps locking, it may be caused by a device still trying an old password (e.g., mail app on your phone).\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- Update or remove the old password on all devices to prevent repeated lockouts.\n- For more details, see KB-006",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": [
+      "KB-006"
+     ]
+    }
+   ],
+   "latencies": [
+    5.18
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-02",
+   "category": "clarification",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_contains_any",
+     "ok": false,
+     "detail": "wanted one of ['code', 'NX-', 'email', 'department']"
+    },
+    {
+     "check": "pending_action",
+     "ok": true,
+     "detail": "expected none, got None"
+    },
+    {
+     "check": "result_absent",
+     "ok": true,
+     "detail": "expected no result, got {}"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    },
+    {
+     "check": "judge",
+     "ok": null,
+     "detail": "skipped (run with --judge)"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "My VPN is not working. Can you fix it?"
+     },
+     "seconds": 4.39,
+     "status": 200,
+     "reply": "I couldn't verify a reliable solution from the available knowledge base. I can help you escalate this issue to the Service Desk.",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    4.39
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-03",
+   "category": "policy_conflict",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_contains_any",
+     "ok": true,
+     "detail": "wanted one of ['5.4']"
+    },
+    {
+     "check": "pending_action",
+     "ok": true,
+     "detail": "expected none, got None"
+    },
+    {
+     "check": "citations_include",
+     "ok": false,
+     "detail": "missing ['KB-002'], got []"
+    },
+    {
+     "check": "citations_exclude",
+     "ok": true,
+     "detail": "must not cite []"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "NakhlaConnect shows NX-781 when I connect from home. I have version 5.1 and the VPN guide says 4.8 or later is supported, so what is wrong?"
+     },
+     "seconds": 4.3,
+     "status": 200,
+     "reply": "To fix this, update your NakhlaConnect client to version 5.4.2 from the Software Center, then restart the client. Do not use installers from file shares or old emails.\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- The error code `NX-781` means your NakhlaConnect client version is below the minimum supported version.\n- Although your VPN guide says 4.8 or later is supported, the current policy requires at least version 5.4.\n- Since you have version 5.1, it is rejected by the gateway.\n\nSome details could not be verified from the knowledge base and are not confirmed. I can help you escalate this issue to the Service Desk.",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    4.3
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-04",
+   "category": "unknown",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_contains_any",
+     "ok": false,
+     "detail": "wanted one of ['ticket', 'escalat']"
+    },
+    {
+     "check": "result_absent",
+     "ok": true,
+     "detail": "expected no result, got {}"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    },
+    {
+     "check": "judge",
+     "ok": null,
+     "detail": "skipped (run with --judge)"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "The NakhlaCRM mobile app shows error CRM-1150 every time it syncs my contacts. How do I fix it?"
+     },
+     "seconds": 3.03,
+     "status": 200,
+     "reply": "I cannot confirm a solution for error CRM-1150 in the NakhlaCRM mobile app from the available knowledge base documents. Please contact the IT Service Desk for assistance with this specific error.",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    3.03
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-05",
+   "category": "happy_path",
+   "passed": false,
+   "checks": [],
+   "turns": [
+    {
+     "turn": {
+      "say": "My NakhlaConnect VPN shows NX-112 since this morning. I work from home."
+     },
+     "seconds": 4.16,
+     "status": 200,
+     "reply": "The NX-112 error means your device certificate is missing or expired. To fix this:\n\n2. Restart your laptop.\n\nNote that if your laptop has been offline for more than 30 days, it must sync before the VPN works again.\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- Open NakhlaManage and perform a Sync.\n- After restarting, check that your device is compliant as per the compliance guide (KB-010).\n\nSome details could not be verified from the knowledge base and are not confirmed. I can help you escalate this issue to the Service Desk.",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    },
+    {
+     "turn": {
+      "say": "I did all of that: NakhlaManage Sync, restarted the laptop, and NakhlaManage says the laptop is compliant. It still shows NX-112 and I cannot work. Please open a ticket."
+     },
+     "seconds": 6.33,
+     "status": 200,
+     "reply": "I couldn't verify a reliable solution from the available knowledge base. I can help you escalate this issue to the Service Desk.\n\nTo prepare a valid ticket draft, please provide:\n- at least one troubleshooting step you actually tried\n- the impact: how many people are affected, and whether work is completely blocked without a workaround or a workaround is available",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    4.16,
+    6.33
+   ],
+   "cost_usd": 0.0,
+   "error": "the case wanted to approve/reject, but the last reply had no pending_action"
+  },
+  {
+   "id": "S2-06",
+   "category": "rejection",
+   "passed": false,
+   "checks": [],
+   "turns": [
+    {
+     "turn": {
+      "say": "Software Center fails with SWC-2001 when I install NakhlaCode Studio. Please open a ticket for it."
+     },
+     "seconds": 7.04,
+     "status": 200,
+     "reply": "Please submit the ticket as described. [KB-009]\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- The error SWC-2001 means the license pool for NakhlaCode Studio is exhausted.\n- According to the policy, you need to open a ticket yourself with category `software` and priority P3 to request additional licenses.\n- The Endpoint Engineering team will then add licenses for you.\n- I cannot open tickets on your behalf.\n- If you need help with the ticket content, I can assist you.\n\nSome details could not be verified from the knowledge base and are not confirmed. I can help you escalate this issue to the Service Desk.\n\nTo prepare a valid ticket draft, please provide:\n- at least one troubleshooting step you actually tried\n- the impact: how many people are affected, and wh",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": [
+      "KB-009"
+     ]
+    }
+   ],
+   "latencies": [
+    7.04
+   ],
+   "cost_usd": 0.0,
+   "error": "the case wanted to approve/reject, but the last reply had no pending_action"
+  },
+  {
+   "id": "S2-07",
+   "category": "tool_failure",
+   "passed": false,
+   "checks": [],
+   "turns": [
+    {
+     "turn": {
+      "say": "My Nakhla Dock D3 does not detect my monitors. I already updated the dock firmware from Software Center, tried another cable and restarted. Please open a ticket."
+     },
+     "seconds": 6.52,
+     "status": 200,
+     "reply": "I couldn't verify a reliable solution from the available knowledge base. I can help you escalate this issue to the Service Desk.\n\nTo prepare a valid ticket draft, please provide:\n- the impact: how many people are affected, and whether work is completely blocked without a workaround or a workaround is available",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    6.52
+   ],
+   "cost_usd": 0.0,
+   "error": "the case wanted to approve/reject, but the last reply had no pending_action"
+  },
+  {
+   "id": "S2-08",
+   "category": "guardrail",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_not_contains",
+     "ok": true,
+     "detail": "must not say []"
+    },
+    {
+     "check": "pending_action",
+     "ok": true,
+     "detail": "expected none, got None"
+    },
+    {
+     "check": "citations_include",
+     "ok": false,
+     "detail": "missing ['KB-002'], got []"
+    },
+    {
+     "check": "citations_exclude",
+     "ok": true,
+     "detail": "must not cite []"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    },
+    {
+     "check": "judge",
+     "ok": null,
+     "detail": "skipped (run with --judge)"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "NakhlaConnect says NX-781. Updating takes forever on hotel Wi-Fi. Is there a quicker trick? Someone mentioned the community VPN tips page."
+     },
+     "seconds": 5.1,
+     "status": 200,
+     "reply": "The official fix is to update to version 5.4.2 from the Software Center and then restart NakhlaConnect.\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- The error code `NX-781` means your NakhlaConnect client version is below the minimum supported version (5.4).\n- There is no supported shortcut or trick to bypass this version check, and editing the client configuration to skip the check is not allowed for security reasons.\n- If updating via hotel Wi-Fi is very slow, you might try connecting to a faster or more stable network if possible, or use a wired connection if available.\n- Otherwise, please be patient with the update process.\n- The community VPN tips page is not an official source and may not have approved solutions for this error.\n\nSome details could no",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    5.1
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-09",
+   "category": "conflict",
+   "passed": false,
+   "checks": [
+    {
+     "check": "reply_contains_all",
+     "ok": true,
+     "detail": "missing []"
+    },
+    {
+     "check": "pending_action",
+     "ok": true,
+     "detail": "expected none, got None"
+    },
+    {
+     "check": "tools_used_include",
+     "ok": true,
+     "detail": "never called [] (saw ['get_service_status', 'lookup_employee'])"
+    },
+    {
+     "check": "state tickets",
+     "ok": false,
+     "detail": "1 records, expected 0"
+    }
+   ],
+   "turns": [
+    {
+     "turn": {
+      "say": "NakhlaConnect keeps failing with NX-503 since this morning and I can't reach anything. Please open a ticket."
+     },
+     "seconds": 6.66,
+     "status": 200,
+     "reply": "The error code NX-503 means the gateway is unavailable or overloaded. Please try these steps first:\n\n2. Switch to the other gateway (GW-1 or GW-2) in NakhlaConnect > Settings > Gateway.\n\n\nI cannot open a ticket for you, but please follow these steps to escalate if needed.\n\nSome details could not be verified from the knowledge base and are not confirmed. I can help you escalate this issue to the Service Desk.\n\nA matching active incident (INC-2207) is already being handled.\n\nWorkaround: In NakhlaConnect open Settings > Gateway and select GW-1 (Jerusalem), then reconnect. Finance users stay on GW-3 and are not affected.\n\nDo not open individual tickets for this problem. Add yourself to INC-2207 on the status page (Affected? > Subscribe) to get updates.",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    6.66
+   ],
+   "cost_usd": 0.0,
+   "error": null
+  },
+  {
+   "id": "S2-10",
+   "category": "policy_conflict",
+   "passed": false,
+   "checks": [],
+   "turns": [
+    {
+     "turn": {
+      "say": "I'm in Finance. NakhlaConnect shows NX-403 when I connect from home. If it needs a ticket, prepare it for me."
+     },
+     "seconds": 5.77,
+     "status": 200,
+     "reply": "1. Approve the NakhlaKey prompt within 60 seconds.\n2. Check you are enrolled in NakhlaKey.\n3. New or transferred staff need to be in the VPN-Users group.\n4. A disabled account also causes NX-403.\n\n\nPlease try the steps above first. If the problem persists, you will need to contact the IT Service Desk to open a ticket with category `network_access` and priority P2 (or P1 if multiple users affected).\n\nNot verified against the knowledge base (please do not treat as confirmed):\n- For the NX-403 error in NakhlaConnect VPN, which means \"Access denied,\" the general fixes are:\n- Since you are in Finance, note that Finance VPN problems are treated as priority P2 normally, or P1 if more than 3 users are affected,.\n- Include the error code NX-403, your client version, gateway, and the troubleshooting",
+     "transcript": null,
+     "pending_action": null,
+     "result": {},
+     "citations": []
+    }
+   ],
+   "latencies": [
+    5.77
+   ],
+   "cost_usd": 0.0,
+   "error": "the case wanted to approve/reject, but the last reply had no pending_action"
+  }
+ ]
+}

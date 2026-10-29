@@ -8,6 +8,11 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Local ticket-reference database and SQLite sidecar files
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
 # your vector index / caches (rebuild them from dataset/)
 *.npz
 .chroma/

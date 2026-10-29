@@ -143,6 +143,7 @@ def run_case(case: dict, urls: dict, client: httpx.Client, cases_file: Path,
     pending = None
     last_action_id = None
     tools_seen: list[str] = []
+    degraded_states: list[str] = []
     app = urls["APP"].rstrip("/")
     for turn in case.get("turns", []):
         t0 = time.perf_counter()
@@ -190,6 +191,8 @@ def run_case(case: dict, urls: dict, client: httpx.Client, cases_file: Path,
             last = {"reply": "", "_http_error": str(exc)}
         out["latencies"].append(round(seconds, 2))
         pending = last.get("pending_action") or None
+        if "persistence_failed" in str(last.get("state") or ""):
+            degraded_states.append(str(last["state"]))
         for tc in last.get("tool_calls") or []:
             tools_seen.append(str(tc.get("tool", tc) if isinstance(tc, dict) else tc))
         usage = last.get("usage") or {}
@@ -223,6 +226,9 @@ def run_case(case: dict, urls: dict, client: httpx.Client, cases_file: Path,
     def check(name: str, ok: bool, detail: str = "") -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
+    if degraded_states:
+        check("local_persistence", False,
+              f"ticket created but its local reference was not saved ({degraded_states})")
     if "_http_status" in last or "_http_error" in last:
         check("http", False, f"last call failed: {last.get('_http_status') or last.get('_http_error')}")
     if "reply_contains_any" in exp:

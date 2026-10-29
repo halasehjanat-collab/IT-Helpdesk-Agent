@@ -1,0 +1,316 @@
+[1mdiff --git a/services/kb_ingestion.py b/services/kb_ingestion.py[m
+[1mindex e9054ec..af7cc1b 100644[m
+[1m--- a/services/kb_ingestion.py[m
+[1m+++ b/services/kb_ingestion.py[m
+[36m@@ -1,4 +1,5 @@[m
+[31m-"""Load Markdown knowledge-base documents and their YAML front matter."""[m
+[32m+[m
+[32m+[m[32m"""Load, parse, and chunk Markdown and PDF knowledge-base documents."""[m
+ [m
+ from __future__ import annotations[m
+ [m
+[36m@@ -9,6 +10,10 @@[m [mfrom typing import Any[m
+ import yaml[m
+ [m
+ [m
+[32m+[m[32mDEFAULT_CHUNK_SIZE = 1000[m
+[32m+[m[32mDEFAULT_CHUNK_OVERLAP = 150[m
+[32m+[m
+[32m+[m
+ @dataclass(frozen=True)[m
+ class KnowledgeBaseDocument:[m
+     metadata: dict[str, Any][m
+[36m@@ -16,79 +21,242 @@[m [mclass KnowledgeBaseDocument:[m
+     source_filename: str[m
+ [m
+ [m
+[31m-def load_markdown_documents([m
+[31m-    knowledge_base_dir: Path | None = None,[m
+[31m-) -> list[KnowledgeBaseDocument]:[m
+[31m-    if knowledge_base_dir is None:[m
+[31m-        knowledge_base_dir = ([m
+[31m-            Path(__file__).resolve().parent.parent / "dataset" / "knowledge_base"[m
+[32m+[m[32m@dataclass(frozen=True)[m
+[32m+[m[32mclass KnowledgeBaseChunk:[m
+[32m+[m[32m    text: str[m
+[32m+[m[32m    metadata: dict[str, Any][m
+[32m+[m[32m    source_filename: str[m
+[32m+[m[32m    chunk_index: int[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef get_knowledge_base_dir() -> Path:[m
+[32m+[m[32m    """Return the project's knowledge-base directory."""[m
+[32m+[m[32m    return ([m
+[32m+[m[32m        Path(__file__).resolve().parent.parent[m
+[32m+[m[32m        / "dataset"[m
+[32m+[m[32m        / "knowledge_base"[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _parse_markdown(path: Path) -> KnowledgeBaseDocument:[m
+[32m+[m[32m    """Read a Markdown file and parse its YAML front matter."""[m
+[32m+[m[32m    text = path.read_text(encoding="utf-8-sig")[m
+[32m+[m[32m    lines = text.splitlines(keepends=True)[m
+[32m+[m
+[32m+[m[32m    if not lines or lines[0].strip() != "---":[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"{path.name}: missing YAML front matter opening delimiter"[m
+         )[m
+[31m-    if not knowledge_base_dir.is_dir():[m
+[31m-        raise FileNotFoundError([m
+[31m-            f"Knowledge-base directory not found: {knowledge_base_dir}"[m
+[32m+[m
+[32m+[m[32m    closing_index = next([m
+[32m+[m[32m        ([m
+[32m+[m[32m            index[m
+[32m+[m[32m            for index, line in enumerate(lines[1:], start=1)[m
+[32m+[m[32m            if line.strip() == "---"[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        None,[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    if closing_index is None:[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"{path.name}: missing YAML front matter closing delimiter"[m
+         )[m
+ [m
+[31m-    documents = [][m
+[31m-    for path in sorted(knowledge_base_dir.glob("*.md")):[m
+[31m-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)[m
+[31m-        if not lines or lines[0].lstrip("\ufeff").rstrip("\r\n") != "---":[m
+[31m-            raise ValueError([m
+[31m-                f"{path.name}: missing YAML front matter opening '---' delimiter"[m
+[31m-            )[m
+[32m+[m[32m    front_matter = "".join(lines[1:closing_index])[m
+[32m+[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        metadata = yaml.safe_load(front_matter)[m
+[32m+[m[32m    except yaml.YAMLError as exc:[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"{path.name}: invalid YAML front matter: {exc}"[m
+[32m+[m[32m        ) from exc[m
+ [m
+[31m-        closing_index = next([m
+[31m-            ([m
+[31m-                index[m
+[31m-                for index, line in enumerate(lines[1:], start=1)[m
+[31m-                if line.rstrip("\r\n") == "---"[m
+[31m-            ),[m
+[31m-            None,[m
+[32m+[m[32m    if not isinstance(metadata, dict) or not metadata:[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"{path.name}: YAML front matter must contain a metadata mapping"[m
+         )[m
+[31m-        if closing_index is None:[m
+[31m-            raise ValueError([m
+[31m-                f"{path.name}: missing YAML front matter closing '---' delimiter"[m
+[31m-            )[m
+ [m
+[31m-        front_matter = "".join(lines[1:closing_index])[m
+[31m-        try:[m
+[31m-            metadata = yaml.safe_load(front_matter)[m
+[31m-        except yaml.YAMLError as exc:[m
+[31m-            raise ValueError([m
+[31m-                f"{path.name}: invalid YAML front matter: {exc}"[m
+[31m-            ) from exc[m
+[31m-[m
+[31m-        if not isinstance(metadata, dict) or not metadata:[m
+[31m-            raise ValueError([m
+[31m-                f"{path.name}: YAML front matter must contain a metadata mapping"[m
+[31m-            )[m
+[32m+[m[32m    body = "".join(lines[closing_index + 1:]).strip()[m
+[32m+[m
+[32m+[m[32m    if not body:[m
+[32m+[m[32m        raise ValueError(f"{path.name}: document body is empty")[m
+[32m+[m
+[32m+[m[32m    metadata = dict(metadata)[m
+[32m+[m[32m    metadata.setdefault("source_filename", path.name)[m
+[32m+[m[32m    metadata.setdefault("source_type", "markdown")[m
+[32m+[m
+[32m+[m[32m    return KnowledgeBaseDocument([m
+[32m+[m[32m        metadata=metadata,[m
+[32m+[m[32m        body=body,[m
+[32m+[m[32m        source_filename=path.name,[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _parse_pdf(path: Path) -> list[KnowledgeBaseDocument]:[m
+[32m+[m[32m    """Extract text from a PDF, preserving its page numbers."""[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        from pypdf import PdfReader[m
+[32m+[m[32m    except ImportError as exc:[m
+[32m+[m[32m        raise ImportError([m
+[32m+[m[32m            "PDF support requires pypdf. Install it with: pip install pypdf"[m
+[32m+[m[32m        ) from exc[m
+[32m+[m
+[32m+[m[32m    reader = PdfReader(str(path))[m
+[32m+[m[32m    documents: list[KnowledgeBaseDocument] = [][m
+[32m+[m
+[32m+[m[32m    for page_number, page in enumerate(reader.pages, start=1):[m
+[32m+[m[32m        text = (page.extract_text() or "").strip()[m
+[32m+[m
+[32m+[m[32m        # Ignore pages without extractable text.[m
+[32m+[m[32m        if not text:[m
+[32m+[m[32m            continue[m
+[32m+[m
+[32m+[m[32m        metadata: dict[str, Any] = {[m
+[32m+[m[32m            "source_filename": path.name,[m
+[32m+[m[32m            "source_type": "pdf",[m
+[32m+[m[32m            "page": page_number,[m
+[32m+[m[32m        }[m
+ [m
+[31m-        body = "".join(lines[closing_index + 1 :]).lstrip("\r\n")[m
+         documents.append([m
+             KnowledgeBaseDocument([m
+                 metadata=metadata,[m
+[31m-                body=body,[m
+[32m+[m[32m                body=text,[m
+                 source_filename=path.name,[m
+             )[m
+         )[m
+ [m
+[32m+[m[32m    if not documents:[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            f"{path.name}: no extractable text found in the PDF. "[m
+[32m+[m[32m            "It may contain scanned images and require OCR."[m
+[32m+[m[32m        )[m
+[32m+[m
+     return documents[m
+ [m
+ [m
+[31m-def _self_check() -> None:[m
+[31m-    documents = load_markdown_documents()[m
+[32m+[m[32mdef load_markdown_documents([m
+[32m+[m[32m    knowledge_base_dir: Path | None = None,[m
+[32m+[m[32m) -> list[KnowledgeBaseDocument]:[m
+[32m+[m[32m    """Load Markdown documents, preserving their YAML metadata."""[m
+[32m+[m[32m    if knowledge_base_dir is None:[m
+[32m+[m[32m        knowledge_base_dir = get_knowledge_base_dir()[m
+[32m+[m
+[32m+[m[32m    if not knowledge_base_dir.is_dir():[m
+[32m+[m[32m        raise FileNotFoundError([m
+[32m+[m[32m            f"Knowledge-base directory not found: {knowledge_base_dir}"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    return [[m
+[32m+[m[32m        _parse_markdown(path)[m
+[32m+[m[32m        for path in sorted(knowledge_base_dir.glob("*.md"))[m
+[32m+[m[32m    ][m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef load_knowledge_base([m
+[32m+[m[32m    knowledge_base_dir: Path | None = None,[m
+[32m+[m[32m) -> list[KnowledgeBaseDocument]:[m
+[32m+[m[32m    """Load all supported Markdown and PDF knowledge-base documents."""[m
+[32m+[m[32m    if knowledge_base_dir is None:[m
+[32m+[m[32m        knowledge_base_dir = get_knowledge_base_dir()[m
+[32m+[m
+[32m+[m[32m    if not knowledge_base_dir.is_dir():[m
+[32m+[m[32m        raise FileNotFoundError([m
+[32m+[m[32m            f"Knowledge-base directory not found: {knowledge_base_dir}"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    documents: list[KnowledgeBaseDocument] = [][m
+[32m+[m
+[32m+[m[32m    for path in sorted(knowledge_base_dir.iterdir()):[m
+[32m+[m[32m        if not path.is_file():[m
+[32m+[m[32m            continue[m
+[32m+[m
+[32m+[m[32m        if path.suffix.lower() == ".md":[m
+[32m+[m[32m            documents.append(_parse_markdown(path))[m
+[32m+[m
+[32m+[m[32m        elif path.suffix.lower() == ".pdf":[m
+[32m+[m[32m            documents.extend(_parse_pdf(path))[m
+[32m+[m
+     if not documents:[m
+[31m-        raise RuntimeError("No Markdown knowledge-base documents were found.")[m
+[32m+[m[32m        raise RuntimeError([m
+[32m+[m[32m            f"No readable Markdown or PDF documents found in "[m
+[32m+[m[32m            f"{knowledge_base_dir}"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    return documents[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef chunk_documents([m
+[32m+[m[32m    documents: list[KnowledgeBaseDocument],[m
+[32m+[m[32m    chunk_size: int = DEFAULT_CHUNK_SIZE,[m
+[32m+[m[32m    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,[m
+[32m+[m[32m) -> list[KnowledgeBaseChunk]:[m
+[32m+[m[32m    """Split documents into overlapping chunks while preserving metadata."""[m
+[32m+[m[32m    if chunk_size <= 0:[m
+[32m+[m[32m        raise ValueError("chunk_size must be greater than zero")[m
+[32m+[m
+[32m+[m[32m    if chunk_overlap < 0 or chunk_overlap >= chunk_size:[m
+[32m+[m[32m        raise ValueError([m
+[32m+[m[32m            "chunk_overlap must be non-negative and smaller than chunk_size"[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    chunks: list[KnowledgeBaseChunk] = [][m
+[32m+[m[32m    step = chunk_size - chunk_overlap[m
+ [m
+     for document in documents:[m
+[31m-        if not document.metadata:[m
+[31m-            raise ValueError(f"{document.source_filename}: metadata is empty")[m
+[31m-        if not document.body.strip():[m
+[31m-            raise ValueError(f"{document.source_filename}: document body is empty")[m
+[31m-        if not document.source_filename:[m
+[31m-            raise ValueError("A loaded document has no source filename")[m
+[32m+[m[32m        text = document.body.strip()[m
+ [m
+[31m-    print(f"OK: loaded and checked {len(documents)} Markdown documents.")[m
+[32m+[m[32m        if not text:[m
+[32m+[m[32m            continue[m
+[32m+[m
+[32m+[m[32m        chunk_index = 0[m
+[32m+[m
+[32m+[m[32m        for start in range(0, len(text), step):[m
+[32m+[m[32m            chunk_text = text[start:start + chunk_size].strip()[m
+[32m+[m
+[32m+[m[32m            if not chunk_text:[m
+[32m+[m[32m                continue[m
+[32m+[m
+[32m+[m[32m            metadata = dict(document.metadata)[m
+[32m+[m[32m            metadata["source_filename"] = document.source_filename[m
+[32m+[m[32m            metadata["chunk_index"] = chunk_index[m
+[32m+[m
+[32m+[m[32m            chunks.append([m
+[32m+[m[32m                KnowledgeBaseChunk([m
+[32m+[m[32m                    text=chunk_text,[m
+[32m+[m[32m                    metadata=metadata,[m
+[32m+[m[32m                    source_filename=document.source_filename,[m
+[32m+[m[32m                    chunk_index=chunk_index,[m
+[32m+[m[32m                )[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            chunk_index += 1[m
+[32m+[m
+[32m+[m[32m            if start + chunk_size >= len(text):[m
+[32m+[m[32m                break[m
+[32m+[m
+[32m+[m[32m    return chunks[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _self_check() -> None:[m
+[32m+[m[32m    """Run a basic ingestion and chunking check."""[m
+[32m+[m[32m    documents = load_knowledge_base()[m
+[32m+[m[32m    chunks = chunk_documents(documents)[m
+[32m+[m
+[32m+[m[32m    markdown_count = sum([m
+[32m+[m[32m        document.metadata.get("source_type") == "markdown"[m
+[32m+[m[32m        for document in documents[m
+[32m+[m[32m    )[m
+[32m+[m[32m    pdf_pages = sum([m
+[32m+[m[32m        document.metadata.get("source_type") == "pdf"[m
+[32m+[m[32m        for document in documents[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    print(f"Loaded Markdown documents: {markdown_count}")[m
+[32m+[m[32m    print(f"Loaded PDF pages with extractable text: {pdf_pages}")[m
+[32m+[m[32m    print(f"Total document records: {len(documents)}")[m
+[32m+[m[32m    print(f"Total chunks created: {len(chunks)}")[m
+ [m
+ [m
+ if __name__ == "__main__":[m
+     _self_check()[m
+[41m+[m

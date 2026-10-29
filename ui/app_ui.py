@@ -22,13 +22,14 @@ def call_app(path: str, body: dict) -> dict:
     try:
         r = httpx.post(f"{APP_URL}{path}", json=body, timeout=180)
     except httpx.HTTPError as exc:
-        return {"reply": f"Cannot reach your app at {APP_URL} ({exc.__class__.__name__}). Is it running?"}
+        return {"reply": f"Cannot reach your app at {APP_URL} ({exc.__class__.__name__}). Is it running?",
+                "_error": True}
     try:
         data = r.json()
     except ValueError:
         data = {"reply": r.text[:500]}
     if r.status_code >= 400:
-        data = {"reply": f"Your app answered HTTP {r.status_code}: {str(data)[:400]}"}
+        data = {"reply": f"Your app answered HTTP {r.status_code}: {str(data)[:400]}", "_error": True}
     return data if isinstance(data, dict) else {"reply": str(data)}
 
 
@@ -39,7 +40,8 @@ def side_panels(data: dict) -> tuple[str, str, str]:
         or "_No knowledge-base article cited in the last answer._")
     calls = data.get("tool_calls") or []
     tools_md = "### Tool calls (last turn)\n" + ("\n".join(
-        f"- `{t.get('tool', '?')}` {'ok' if t.get('ok') else 'FAILED'} · {t.get('ms', '?')} ms"
+        f"- `{t.get('tool', '?')}` {'ok' if t.get('ok') else 'FAILED'}"
+        + (f" · {t['ms']} ms" if t.get("ms") is not None else "")
         for t in calls if isinstance(t, dict)) or "_none_")
     result = data.get("result") or {}
     state = data.get("state")
@@ -68,22 +70,30 @@ def ticket_card(pending: dict | None) -> str:
     return "\n".join(lines)
 
 
-def show(data: dict, history: list):
+def show(data: dict, history: list, previous: dict | None = None, keep_undecided: bool = False):
     history = history + [{"role": "assistant", "content": data.get("reply") or "(empty reply)"}]
     pending = data.get("pending_action") or None
+    # Only the turn that creates a draft returns it; the backend keeps it until it is decided.
+    # An ordinary chat reply must not make the card disappear while the draft is still pending.
+    if pending is None and keep_undecided and previous:
+        pending = previous
+    # The backend still holds the draft after a transport/HTTP error, and allows retrying the
+    # same approved action after a failed creation, so keep the card and buttons in those cases.
+    if pending is None and previous and (data.get("_error") or data.get("state") == "ticket_creation_failed"):
+        pending = previous
     cite_md, tools_md, result_md = side_panels(data)
     buttons = gr.update(interactive=bool(pending))
     return history, pending, ticket_card(pending), buttons, buttons, cite_md, tools_md, result_md
 
 
-def send(message: str, history: list, session_id: str, email: str):
+def send(message: str, history: list, session_id: str, email: str, pending: dict | None = None):
     if not message.strip():
         return ("", history, *[gr.skip()] * 7)
     body = {"session_id": session_id, "message": message}
     if email.strip():
         body["user"] = {"email": email.strip().lower()}
     history = history + [{"role": "user", "content": message}]
-    return ("", *show(call_app("/api/chat", body), history))
+    return ("", *show(call_app("/api/chat", body), history, pending, keep_undecided=True))
 
 
 def decide(approved: bool, history: list, session_id: str, pending: dict | None):
@@ -92,7 +102,7 @@ def decide(approved: bool, history: list, session_id: str, pending: dict | None)
     history = history + [{"role": "user", "content": "Approve" if approved else "Reject"}]
     data = call_app("/api/approve", {"session_id": session_id, "action_id": pending.get("action_id"),
                                      "approved": approved})
-    return show(data, history)
+    return show(data, history, pending)
 
 
 with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
@@ -116,7 +126,7 @@ with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
             cites = gr.Markdown("### Sources\n_No answer yet._")
             tools = gr.Markdown("### Tool calls (last turn)\n_none_")
     outputs = [chat, pending_state, card, approve_btn, reject_btn, cites, tools, result]
-    msg.submit(send, [msg, chat, session, email], [msg, *outputs])
+    msg.submit(send, [msg, chat, session, email, pending_state], [msg, *outputs])
     approve_btn.click(lambda h, s, p: decide(True, h, s, p), [chat, session, pending_state], outputs)
     reject_btn.click(lambda h, s, p: decide(False, h, s, p), [chat, session, pending_state], outputs)
 

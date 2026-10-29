@@ -14,7 +14,11 @@ Test-only admin endpoints (no key, for eval runners - your app must not call the
     GET  /admin/log · GET /admin/tickets (?all=1) · GET /admin/notes
 Env: HELPDESK_API_KEY (default dev-key-change-me), HELPDESK_TODAY (YYYY-MM-DD, default real today),
      HELPDESK_DATA_DIR (default services/data), HELPDESK_DATASET_DIR (default dataset).
-State is in memory, seeded from JSON at start-up and on POST /admin/reset.
+Directory, status page, faults and the request log are in memory, seeded from JSON at start-up and on
+POST /admin/reset. Tickets created through the API, their notes and idempotency records are persisted in SQLite
+(HELPDESK_TICKET_DB_PATH, default services/data/helpdesk_tickets.sqlite3); the historical JSON archive is a
+read-only seed. /admin/reset never deletes persisted tickets unless HELPDESK_ALLOW_DESTRUCTIVE_RESET=1 AND
+HELPDESK_TICKET_DB_PATH is set explicitly (an isolated test database).
 """
 from __future__ import annotations
 
@@ -35,6 +39,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from jsonschema import Draft202012Validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from services.helpdesk_ticket_db import (
+    IdempotencyConflict,
+    TicketDatabase,
+    TicketDatabaseError,
+    configured_ticket_db_path,
+)
+from services.local_ticket_store import configured_database_path as configured_metadata_db_path
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parent
@@ -108,10 +120,6 @@ def reset_state() -> None:
         "employees": {e["email"]: e for e in _read_json(DATA_DIR / "employees.json")["employees"]},
         "status": json.loads(_render_dates((DATA_DIR / "status.json").read_text(encoding="utf-8"))),
         "archive": _read_json(DATASET_DIR / "tickets" / "historical_tickets.json")["tickets"],
-        "created": [],
-        "notes_added": [],
-        "next_id": 2001,
-        "idempotency": {},
         "faults": {},
         "log": deque(maxlen=500),
         "docs": {d["id"]: {"title": d["title"], "status": d["status"],
@@ -122,14 +130,50 @@ def reset_state() -> None:
 
 reset_state()
 
+TICKET_DB: TicketDatabase | None = None
+
+
+def ticket_db() -> TicketDatabase:
+    """The persistent ticket store, opened on first use (creating tables, never touching existing rows)."""
+    global TICKET_DB
+    if TICKET_DB is None:
+        path = configured_ticket_db_path(KIT, DATA_DIR)
+        if path == configured_metadata_db_path():
+            raise TicketDatabaseError("The ticket database must not be the app metadata database.")
+        database = TicketDatabase(path)
+        database.initialize()
+        TICKET_DB = database
+    return TICKET_DB
+
+
+def destructive_reset_allowed() -> bool:
+    """Only an explicitly configured, opted-in test database may be wiped; never the default dev database."""
+    return os.getenv("HELPDESK_ALLOW_DESTRUCTIVE_RESET") == "1" and bool(
+        (os.getenv("HELPDESK_TICKET_DB_PATH") or "").strip()
+    )
+
 
 def all_tickets() -> list[dict]:
-    return STATE["archive"] + STATE["created"]
+    """Read-only archive (with any persisted notes overlaid) followed by database-backed tickets."""
+    database = ticket_db()
+    extra_notes = database.notes_by_ticket()
+    merged = []
+    for archived in STATE["archive"]:
+        ticket = copy.deepcopy(archived)
+        ticket["notes"] = list(ticket.get("notes", [])) + extra_notes.get(ticket["ticket_id"], [])
+        merged.append(ticket)
+    return merged + database.list_tickets()
 
 
 def find_ticket(ticket_id: str) -> dict | None:
     tid = ticket_id.strip().upper()
-    return next((t for t in all_tickets() if t["ticket_id"] == tid), None)
+    archived = next((t for t in STATE["archive"] if t["ticket_id"] == tid), None)
+    database = ticket_db()
+    if archived is not None:
+        ticket = copy.deepcopy(archived)
+        ticket["notes"] = list(ticket.get("notes", [])) + database.notes_for(tid)
+        return ticket
+    return database.get_ticket(tid)
 
 
 # ----------------------------------------------------------------- helpers
@@ -201,6 +245,12 @@ async def auth_and_log(request: Request, call_next):
 async def http_error(_: Request, exc: StarletteHTTPException):
     code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
     return error(exc.status_code, code, str(exc.detail))
+
+
+@app.exception_handler(TicketDatabaseError)
+async def storage_error(_: Request, exc: TicketDatabaseError):
+    # Writes run in one transaction, so a storage failure never leaves a half-created ticket or note.
+    return error(503, "storage_unavailable", "The ticket store is unavailable. Nothing was changed.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -290,13 +340,14 @@ async def create_ticket(request: Request):
         body["kb_refs"] = [r.strip().upper() if isinstance(r, str) else r for r in body["kb_refs"]]
 
     key = request.headers.get("idempotency-key")
+    database = ticket_db()
     if key:
-        seen = STATE["idempotency"].get(("create_ticket", key))
+        seen = database.get_idempotent("create_ticket", key)
         if seen:
-            if seen["hash"] != body_hash(body):
+            if seen["request_hash"] != body_hash(body):
                 return error(409, "idempotency_conflict",
                              "This Idempotency-Key was already used with a different ticket body.")
-            return JSONResponse(copy.deepcopy(seen["response"]), status_code=201, headers={"Idempotent-Replayed": "true"})
+            return JSONResponse(seen["response"], status_code=201, headers={"Idempotent-Replayed": "true"})
 
     errors = field_errors(body)
     employee = STATE["employees"].get(body.get("requester_email", ""))
@@ -318,23 +369,24 @@ async def create_ticket(request: Request):
             warnings.append(f"{ref} is deprecated" + (f" (superseded by {doc['superseded_by']})" if doc["superseded_by"] else ""))
         elif doc["status"] == "draft":
             warnings.append(f"{ref} is an unreviewed draft")
-    ticket = {
-        "ticket_id": f"IT-{STATE['next_id']}",
+    fields = {
         "subject": body["subject"], "description": body["description"],
-        "category": body["category"], "priority": body["priority"], "status": "open",
+        "category": body["category"], "priority": body["priority"],
         "requester_email": body["requester_email"], "department": body["department"],
         "affected_users": body.get("affected_users", 1),
         "assigned_team": ROUTING[body["category"]],
         "attempted_steps": body["attempted_steps"], "kb_refs": body["kb_refs"],
-        "resolution": None, "created_at": now_iso(), "resolved_at": None, "notes": [],
+        "warnings": warnings,
     }
-    if warnings:
-        ticket["warnings"] = warnings
-    STATE["next_id"] += 1
-    STATE["created"].append(ticket)
-    if key:
-        STATE["idempotency"][("create_ticket", key)] = {"hash": body_hash(body), "response": copy.deepcopy(ticket)}
-    return JSONResponse(copy.deepcopy(ticket), status_code=201, headers={"Location": f"/api/tickets/{ticket['ticket_id']}"})
+    try:
+        ticket, replayed = database.create_ticket(
+            fields, created_at=now_iso(), idempotency_key=key, request_hash=body_hash(body))
+    except IdempotencyConflict:
+        return error(409, "idempotency_conflict",
+                     "This Idempotency-Key was already used with a different ticket body.")
+    if replayed:
+        return JSONResponse(ticket, status_code=201, headers={"Idempotent-Replayed": "true"})
+    return JSONResponse(ticket, status_code=201, headers={"Location": f"/api/tickets/{ticket['ticket_id']}"})
 
 
 @app.post("/api/tickets/{ticket_id}/notes", status_code=201, tags=["tickets"])
@@ -354,27 +406,30 @@ async def add_note(ticket_id: str, request: Request):
         return error(422, "validation_error", "note must be 1-2000 characters.",
                      fields=[{"field": "note", "message": "must be 1-2000 characters"}])
     key = request.headers.get("idempotency-key")
-    if key:
-        seen = STATE["idempotency"].get(("add_note", key))
-        if seen:
-            if seen["hash"] != body_hash({"t": ticket["ticket_id"], **body}):
-                return error(409, "idempotency_conflict", "This Idempotency-Key was already used with a different note.")
-            return JSONResponse(copy.deepcopy(seen["response"]), status_code=201, headers={"Idempotent-Replayed": "true"})
-    entry = {"at": now_iso(), "author": str(author)[:80], "text": note.strip()}
-    ticket["notes"].append(entry)
-    STATE["notes_added"].append({"ticket_id": ticket["ticket_id"], **entry})
-    response = {"ticket_id": ticket["ticket_id"], "note": entry, "notes_count": len(ticket["notes"])}
-    if key:
-        STATE["idempotency"][("add_note", key)] = {"hash": body_hash({"t": ticket["ticket_id"], **body}),
-                                                   "response": response}
-    return JSONResponse(response, status_code=201)
+    database = ticket_db()
+    request_hash = body_hash({"t": ticket["ticket_id"], **body})
+    archived = next((t for t in STATE["archive"] if t["ticket_id"] == ticket["ticket_id"]), None)
+    archive_note_count = len(archived.get("notes", [])) if archived is not None else 0
+    try:
+        response, replayed = database.add_note(
+            ticket["ticket_id"], at=now_iso(), author=str(author)[:80], text=note.strip(),
+            archive_note_count=archive_note_count, idempotency_key=key, request_hash=request_hash)
+    except IdempotencyConflict:
+        return error(409, "idempotency_conflict", "This Idempotency-Key was already used with a different note.")
+    headers = {"Idempotent-Replayed": "true"} if replayed else None
+    return JSONResponse(response, status_code=201, headers=headers)
 
 
 # ----------------------------------------------------------------- test-only admin endpoints
 @app.post("/admin/reset", tags=["admin (test-only)"])
 async def admin_reset():
+    database = ticket_db()
+    destructive = destructive_reset_allowed()
+    if destructive:
+        database.clear_all()
     reset_state()
-    return {"ok": True, "archive_tickets": len(STATE["archive"]), "created_tickets": 0, "today": today().isoformat()}
+    return {"ok": True, "archive_tickets": len(STATE["archive"]), "created_tickets": database.count_tickets(),
+            "persistent_tickets_preserved": not destructive, "today": today().isoformat()}
 
 
 @app.post("/admin/faults", tags=["admin (test-only)"])
@@ -410,10 +465,11 @@ async def admin_log(limit: int = 100):
 
 @app.get("/admin/tickets", tags=["admin (test-only)"])
 async def admin_tickets(all: bool = False):  # noqa: A002 - query name fixed by the spec
-    tickets = all_tickets() if all else STATE["created"]
-    return {"tickets": copy.deepcopy(tickets), "count": len(tickets)}
+    tickets = all_tickets() if all else ticket_db().list_tickets()
+    return {"tickets": tickets, "count": len(tickets)}
 
 
 @app.get("/admin/notes", tags=["admin (test-only)"])
 async def admin_notes():
-    return {"notes": copy.deepcopy(STATE["notes_added"]), "count": len(STATE["notes_added"])}
+    notes = ticket_db().list_notes()
+    return {"notes": notes, "count": len(notes)}

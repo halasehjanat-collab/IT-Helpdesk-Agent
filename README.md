@@ -75,12 +75,12 @@ They exist for the eval runner and the hidden tests. **Your app must not call th
 
 | Method | Path | What it does |
 |---|---|---|
-| POST | `/admin/reset` | restore the seed data, clear faults, logs and created tickets |
+| POST | `/admin/reset` | restore seed data, clear faults and logs. **Persisted tickets, notes and ids are kept** (see "Permanent ticket storage") |
 | POST | `/admin/faults` | `{"target": "create_ticket", "mode": "error_503", "count": 1}`: the next `count` calls of that operation fail |
 | GET / DELETE | `/admin/faults` | show / clear armed faults |
 | GET | `/admin/log` | recent requests: method, path, status, ms, operation |
-| GET | `/admin/tickets` | tickets created since the last reset (`?all=1`: archive too) |
-| GET | `/admin/notes` | notes added since the last reset |
+| GET | `/admin/tickets` | tickets created through the API, persisted in SQLite (`?all=1`: archive too) |
+| GET | `/admin/notes` | notes added through the API, persisted in SQLite |
 
 Fault targets: `create_ticket`, `directory`, `status`, `search_tickets`, `get_ticket`, `add_note`.
 Modes: `error_500`, `error_503`, `timeout` (waits 15 s, then 504), `slow` (waits 3 s, then succeeds).
@@ -124,10 +124,184 @@ The knowledge base is **not** an MCP tool: ingestion, chunking, embeddings and r
 
 ## The approval gate
 
-Keep `create_ticket` (and `add_ticket_note`) **out of the model's tool list**. The model drafts a
-ticket; your API returns it as `pending_action` (`type: "create_ticket"`); only `POST /api/approve`
-calls `create_ticket` over MCP with exactly that payload and `idempotency_key = action_id`.
-Show only the `ticket_id` the API returned. A rejected draft writes nothing.
+Keep `create_ticket` (and `add_ticket_note`) **out of the model's tool list**. The application
+prepares a ticket draft from the conversation and verified directory/status results; `/api/chat`
+returns it as `pending_action` (`type: "create_ticket"`). Only `POST /api/approve` calls
+`create_ticket` over MCP with exactly that payload and `idempotency_key = action_id`. Show only
+the `ticket_id` the API returned. A rejected draft writes nothing.
+
+Ticket intake starts only after an explicit request to prepare/open a ticket; ordinary
+troubleshooting remains a normal chat turn. The app asks follow-up questions for missing facts,
+checks a supplied Nakhla work email against the employee directory, and checks service status
+before registering a draft. A matching active incident is directed to its existing workaround
+instead of producing an individual ticket. The generated payload is checked against
+`dataset/schemas/ticket.schema.json` before it is returned or stored as a pending action.
+
+The current UI and `/api/chat` contract accept an email address from the user but do not provide
+an authenticated identity. Directory lookup therefore confirms that the employee record and
+department exist and match the supplied address; it does not prove that the caller owns that
+address. Deployments that need caller identity assurance must add trusted authentication rather
+than treating the chat email field as proof of identity.
+
+## Local ticket metadata and JSON export
+
+The app uses Python's built-in SQLite support to retain a local reference after the external
+helpdesk API confirms ticket creation. By default the database is
+`services/data/helpdesk_metadata.sqlite3`; set `HELPDESK_METADATA_DB_PATH` to an absolute path
+or a path relative to this project directory to change it. The app creates the database and
+tables on startup. SQLite stores only the approval action's idempotency key, the external ticket
+ID, local creation time, status, and a SHA-256 digest of the validated ticket payload. It does
+not store another editable copy of ticket bodies, credentials, or API keys.
+
+The helpdesk API remains the authority for actual ticket records. The SQLite record is local
+tracking metadata and cannot make a database transaction atomic with the remote API. If the
+remote ticket is created while local persistence is unavailable, the response identifies the
+ticket and reports the local persistence failure; retrying the same approved action does not
+submit a second ticket.
+The simulated helpdesk API now persists its own tickets; see "Permanent ticket storage" below.
+This metadata database does not hold ticket bodies.
+
+`dataset/schemas/ticket.schema.json` remains the JSON Schema used to validate ticket payloads;
+it is not ticket data. JSON ticket data is not maintained as a second live store. To create a
+point-in-time JSON export of the local ticket-reference metadata, run this from the project
+directory:
+
+```powershell
+python -m services.export_ticket_metadata exports/ticket-references.json
+```
+
+The export uses a versioned metadata format and contains references and payload digests, not
+the ticket body. SQLite remains the local source for this metadata; the JSON file is a
+regenerable export. The generated database and its SQLite sidecar files are ignored by Git.
+
+Run the app after starting the helpdesk API and configuring `.env`:
+
+```powershell
+uvicorn app:app --port 8000
+```
+
+Run the test suite with:
+
+```powershell
+python -m pytest -v
+```
+
+SQLite is appropriate for this single-instance training app. A multi-instance production
+deployment should use a shared transactional database and an authenticated identity provider;
+the remote helpdesk system should remain authoritative for ticket content. A production
+deployment also needs an operational backup/retention policy for local metadata and a recovery
+strategy for remote-success/local-database-failure cases.
+
+## Permanent ticket storage (simulated helpdesk API)
+
+The simulated helpdesk API is the system of record for tickets in this kit. It stores complete
+ticket records, notes and idempotency records in its own SQLite database,
+`services/data/helpdesk_tickets.sqlite3` by default (`HELPDESK_TICKET_DB_PATH`, absolute or relative
+to this folder). It must not be the same file as the app metadata database. Tables:
+`tickets`, `ticket_notes`, `idempotency_records`, `id_counter`. Writes use one transaction each;
+a storage failure returns `503 storage_unavailable` and changes nothing.
+
+- `dataset/tickets/historical_tickets.json` stays a read-only seed archive (IT-1001...). Search and
+  retrieval combine it with database tickets. Notes added to archived tickets are stored in the
+  database and overlaid on read; the archive file is never rewritten.
+- New ids start at IT-2001 and only move forward: they survive restarts and are never reused.
+- Starting the API never deletes or resets data. `POST /admin/reset` reloads the seed directory,
+  status page, faults and log but **keeps tickets, notes and ids**. It only wipes the ticket database
+  when `HELPDESK_ALLOW_DESTRUCTIVE_RESET=1` **and** `HELPDESK_TICKET_DB_PATH` is set explicitly, so
+  evals/tests that need a clean slate must use a temporary database path.
+- Tickets created by the earlier in-memory API were never saved; their bodies cannot be rebuilt
+  (the metadata database holds only references and digests).
+- If a real external helpdesk is configured instead of this simulator, that system stays
+  authoritative; do not use this database as a second editable ticket store.
+
+Approval durability: pending (non test-only) ticket drafts, the user's decision and the write status
+are stored in an additive `approval_actions` table of the app metadata database, so an approval can
+complete after an app restart. The session id is kept only as a SHA-256 hash (a different session
+still cannot approve), the draft is checked against its stored digest on load, the draft body is
+removed once the ticket is created and recorded, and test-only drafts are never stored. A write that
+was interrupted is retried with the same idempotency key, so no duplicate ticket is created.
+`/api/chat` still never creates a ticket.
+
+Three different JSON things:
+
+| File | Purpose |
+|---|---|
+| `dataset/schemas/ticket.schema.json` | JSON Schema contract (not data) |
+| `python -m services.export_ticket_history out.json [--include-archive]` | **full** ticket-history export, format `helpdesk-ticket-history-export-v1`, every record validated against `$defs/ticket_record` |
+| `python -m services.export_ticket_metadata out.json` | metadata-only export, format `helpdesk-ticket-reference-export-v1` (no bodies) |
+
+Fields such as category, status, department, requester, resolution, `resolved_at` and `created_at` are
+stored as indexed columns for later search, trend and knowledge-learning work (not implemented here).
+Limitations: remote and local writes are not atomic; intake follow-up conversation state is still in
+memory; in Docker, mount a volume for `services/data` or the ticket database is lost with the container.
+
+## Ticket intelligence API (read-only, token-gated)
+
+`services/ticket_intelligence.py` analyses existing tickets with deterministic local code: no LLM, no
+embeddings, no MCP and no network calls. `app.py` exposes it through three routes that are **disabled
+(404) unless `HELPDESK_INTELLIGENCE_TOKEN` is set** and are never called from `/api/chat`.
+
+| Route (POST, JSON body) | Returns |
+|---|---|
+| `/api/intelligence/duplicates` | candidate duplicate tickets: ticket ID, status, matching reasons and evidence (shared error codes, text similarity, same requester, days apart) |
+| `/api/intelligence/trends` | observed counts per period and group, time range, sample size, data source, limitations |
+| `/api/intelligence/knowledge-proposals` | draft, **unverified** KB-improvement proposals with source ticket IDs, KB reference checks and uncertainty |
+
+Local-only usage (put the token in your own, gitignored `.env`; never commit it):
+
+```powershell
+$env:HELPDESK_INTELLIGENCE_TOKEN = "choose-a-long-random-value"
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+curl.exe -X POST http://127.0.0.1:8000/api/intelligence/trends -H "Authorization: Bearer $env:HELPDESK_INTELLIGENCE_TOKEN" -H "Content-Type: application/json" -d "{}"
+```
+
+Guarantees: read-only (tickets, archive, Knowledge Base and approval state are never written); results keep
+`automatic_action: none`, limitations and uncertainty; proposals are always `verified: false`,
+`publishable: false`, `requires_human_review: true` and never include resolution text; duplicate results
+contain no descriptions or requester emails; trend and proposal results never include predictions or a
+significance claim. Data comes from the historical archive plus `HELPDESK_TICKET_DB_PATH` (an absent ticket
+database is read as empty and is never created). Data failures return a generic 503.
+
+Security limitations: a single shared bearer token is the only control. It identifies no individual user,
+is not a role system, and gives no audit trail; `session_id` and self-asserted emails are not authorization.
+Use it on localhost or behind a trusted network or reverse proxy with TLS, and rotate it by changing the
+variable and restarting. There is no rate limiting. Duplicate detection is a conservative signal and misses
+duplicates that share no error code and use different wording; conflict flags on proposals are a word-overlap
+heuristic; database-created tickets carry no resolution yet, so proposals currently come from archived tickets.
+
+## Chat memory (short-term, long-term, history)
+
+Implemented in `services/chat_memory.py`, stored in its own SQLite file
+`services/data/chat_memory.sqlite3` (override with `CHAT_MEMORY_DB_PATH`; gitignored). It is
+separate from the ticket and approval databases.
+
+- **Conversation history (short-term):** every `/api/chat` turn stores the user message and the
+  final *verified* assistant reply with a timestamp. Only the last 6 messages are sent to the
+  model; at most 20 messages per session and 500 sessions are kept (oldest removed first). A
+  request retried within 10 seconds with the same message and reply is not stored twice.
+  History survives restarts, so a clarifying question and the user's answer stay connected.
+- **Long-term memory:**
+  - *User facts*: operating system, preferred language and answer style (concise/detailed), taken
+    from fixed vocabularies only. Each fact records whether it was `explicit` (stated by the user)
+    or `inferred` (uncertain, e.g. PowerShell implies Windows), plus created/updated times. A newer
+    explicit statement replaces an older value; an inference never overwrites an explicit fact.
+    Style and language apply to every answer; environment facts are offered only for technical
+    requests.
+  - *Resolution notes*: a verified, cited answer is staged, and saved only when the user then says
+    it worked ("that worked", "problem solved"). Abstentions, partially verified or uncited answers
+    and questions are never saved. A note is offered back only when it overlaps the new message.
+- **Safety:** passwords, tokens, API keys and MFA codes are redacted from history and block
+  facts and notes. Quoted/pasted text is ignored. Memory reaches the model only as an untrusted
+  context message: it is not a knowledge-base source, never reaches the answer verifier as
+  evidence, and cannot override KB precedence, system rules or ticket approval. Memory never
+  creates or approves tickets.
+- **Delete:** `POST /api/memory/forget` with `{"session_id": ...}` removes that session's history,
+  facts and notes.
+- **Identity limitation:** the app has no authentication (`user.email` in `/api/chat` is not
+  verified), so memory is scoped to the SHA-256 hash of `session_id`. A new session starts empty,
+  and anyone who knows a session ID could read or delete that session's memory, as with its
+  pending approvals. There is no cross-session personalization.
+- **Tests:** `python -m pytest -q` (offline; uses temporary databases only).
 
 ## Environment variables
 
@@ -138,6 +312,10 @@ Show only the `ticket_id` the API returned. A rejected draft writes nothing.
 | `HELPDESK_TODAY` | real today | API: date of new tickets and of the status page (`YYYY-MM-DD`) |
 | `HELPDESK_TIMEOUT_S` | `20` | MCP server: seconds before a call to the API gives up |
 | `HELPDESK_MCP_LOG_LEVEL` | `WARNING` | MCP server log level on stderr |
+| `HELPDESK_METADATA_DB_PATH` | `services/data/helpdesk_metadata.sqlite3` | app: local SQLite ticket-reference metadata and approval state |
+| `HELPDESK_TICKET_DB_PATH` | `services/data/helpdesk_tickets.sqlite3` | API: persistent ticket database |
+| `HELPDESK_ALLOW_DESTRUCTIVE_RESET` | unset | API: `1` lets `/admin/reset` wipe an explicitly configured ticket DB (tests only) |
+| `HELPDESK_INTELLIGENCE_TOKEN` | unset (routes disabled) | app: bearer token enabling the read-only `/api/intelligence/*` routes |
 | `HELPDESK_DATA_DIR`, `HELPDESK_DATASET_DIR` | `services/data`, `dataset` | API seed files |
 | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `MODEL`, `EMBEDDING_MODEL` | see `.env.example` | your agent |
 | `APP_URL` | `http://localhost:8000` | UI starter, eval runner |
@@ -150,6 +328,9 @@ The API and the MCP server also read the kit's `.env` (without overriding variab
 python ui/app_ui.py                          # http://localhost:7860, talks to APP_URL
 python evals/run_evals.py                    # the 10 sample cases against your app on :8000
 python evals/run_evals.py --only S2-05 -v    # one case, every turn
+# Live and optional (real model calls): same cases on throw-away servers (8110/8112)
+# with temporary databases, so your real tickets are never read or reset.
+python evals/run_isolated_evals.py           # writes evals/isolated_scorecard.md/.json
 ```
 
 The case format and the API contract are described in the mini-project's `common/CONTRACT.md`.
@@ -162,4 +343,4 @@ The case format and the API contract are described in the mini-project's `common
 | 401 `unauthorized` | the same `HELPDESK_API_KEY` for the API, the MCP server and your app |
 | MCP tool returns `unreachable` | the API is not running, or `HELPDESK_API_URL` is wrong (in Docker use the service name) |
 | Everything fails with 503 | a fault is still armed: `curl.exe -X DELETE http://localhost:8102/admin/faults` |
-| Ticket ids keep growing | `POST /admin/reset` restores the seed state (tests do this before every case) |
+| Ticket ids keep growing | expected: ids persist and are never reused. To start clean, point `HELPDESK_TICKET_DB_PATH` at a new file |
