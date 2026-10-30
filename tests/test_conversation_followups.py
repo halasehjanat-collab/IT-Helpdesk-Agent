@@ -244,9 +244,8 @@ def test_verified_reply_with_removed_step_keeps_consecutive_numbers():
     steps = [l for l in out.reply.splitlines() if l[:2] in ("1.", "2.", "3.")]
     assert [l[:2] for l in steps] == ["1.", "2."]
     assert "printer firmware" not in "\n".join(steps)
-    assert av.UNVERIFIED_HEADER in out.reply
-    assert "printer firmware" in out.reply.split(av.UNVERIFIED_HEADER)[1]
-    assert out.reply.count(av.UNVERIFIED_HEADER) == 1
+    assert av.UNVERIFIED_HEADER not in out.reply
+    assert "printer firmware" not in out.reply
     assert out.reply.count(av.PARTIAL_NOTE) == 1
 
 

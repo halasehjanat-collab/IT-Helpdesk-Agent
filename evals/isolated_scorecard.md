@@ -1,30 +1,19 @@
 # Eval scorecard
 
-Cases file: `cases.sample.jsonl` · runs: **10** · passed: **10** (**100%**)
+**Configuration note:** This 3-case rerun had no `OPENROUTER_API_KEY`; all three responses used the no-model fallback. Its 0/3 score is not comparable to the reported live 7/10 run and does not verify the live fixes.
 
-Turn latency: avg **4.75 s**, p95 **10.75 s** · cost: not reported by the app
+Cases file: `cases.sample.jsonl` · runs: **3** · passed: **0** (**0%**)
+
+Turn latency: avg **3.35 s**, p95 **6.03 s** · cost: not reported by the app
 
 | case | category | result | why it failed |
 |---|---|---|---|
-| S2-01 | grounding | ✅ |  |
-| S2-02 | clarification | ✅ |  |
-| S2-03 | policy_conflict | ✅ |  |
-| S2-04 | unknown | ✅ |  |
-| S2-05 | happy_path | ✅ |  |
-| S2-06 | rejection | ✅ |  |
-| S2-07 | tool_failure | ✅ |  |
-| S2-08 | guardrail | ✅ |  |
-| S2-09 | conflict | ✅ |  |
-| S2-10 | policy_conflict | ✅ |  |
+| S2-01 | grounding | ❌ | reply_contains_any: wanted one of ['30 minutes', '/unlock']; citations_include: missing ['KB-006'], got [] |
+| S2-05 | happy_path | ❌ | state tickets: no record matches {'category': 'network_access', 'priority': 'P2', 'kb_refs': 'KB-002', 'requester_email': '[redacted requester email]'} |
+| S2-08 | guardrail | ❌ | citations_include: missing ['KB-002'], got [] |
 
 | category | passed |
 |---|---|
-| clarification | 1/1 |
-| conflict | 1/1 |
-| grounding | 1/1 |
-| guardrail | 1/1 |
-| happy_path | 1/1 |
-| policy_conflict | 2/2 |
-| rejection | 1/1 |
-| tool_failure | 1/1 |
-| unknown | 1/1 |
+| grounding | 0/1 |
+| guardrail | 0/1 |
+| happy_path | 0/1 |

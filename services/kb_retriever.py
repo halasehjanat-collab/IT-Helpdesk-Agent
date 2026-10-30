@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -53,14 +54,81 @@ class RetrievedChunk:
     score: float
 
 
-def _tokenize(text: str) -> set[str]:
-    """Tokenize words, document IDs, and technical error codes."""
-    return set(
-        re.findall(
-            r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,}",
-            text.lower(),
+def _stem(token: str) -> str:
+    """Fold simple plurals (priorities -> priority, tickets -> ticket).
+
+    Tokens containing digits (error codes, document IDs) are left unchanged.
+    """
+    if any(character.isdigit() for character in token) or len(token) <= 3:
+        return token
+
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+
+    if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+
+    return token
+
+
+def _raw_tokens(text: str) -> list[str]:
+    return [
+        token
+        for token in (
+            raw.rstrip("._-")
+            for raw in re.findall(
+                r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,}",
+                text.lower(),
+            )
         )
-    )
+        if token
+    ]
+
+
+def _tokenize(text: str) -> set[str]:
+    """Tokenize words, document IDs, and technical error codes.
+
+    Trailing punctuation is dropped so "priority." and "KB-015." match, and
+    simple plurals are folded.
+    """
+    return {_stem(token) for token in _raw_tokens(text)}
+
+
+_STOPWORDS = frozenset(
+    "a an and any are as at be been but by can could did do does for from "
+    "get got had has have how i if in into is it its me my no not of on or "
+    "our should so that the their them then there these they this to up us "
+    "was we were what when where which who why will with would you your "
+    "am im ive about also just please help need want still again keeps "
+    "tried try trying know".split()
+)
+
+
+def _query_terms(text: str) -> set[str]:
+    """Query tokens without filler words; keeps all tokens if nothing remains."""
+    terms = _tokenize(text)
+    meaningful = {
+        _stem(token)
+        for token in _raw_tokens(text)
+        if token not in _STOPWORDS
+    }
+    return meaningful or terms
+
+
+def _term_weights(chunks: list[KnowledgeBaseChunk]) -> dict[str, float]:
+    """Inverse-document-frequency weights so rare terms outrank common ones."""
+    frequency: dict[str, int] = {}
+
+    for chunk in chunks:
+        for term in _tokenize(chunk.text):
+            frequency[term] = frequency.get(term, 0) + 1
+
+    total = max(len(chunks), 1)
+
+    return {
+        term: math.log(1 + total / count)
+        for term, count in frequency.items()
+    }
 
 
 def _metadata_value(
@@ -98,9 +166,14 @@ def _eligible_chunks(
 def _lexical_score(
     query: str,
     chunk: KnowledgeBaseChunk,
+    weights: dict[str, float] | None = None,
 ) -> float:
-    """Calculate a weighted keyword-overlap score."""
-    query_terms = _tokenize(query)
+    """Calculate a weighted keyword-overlap score.
+
+    Filler words never score. With `weights` (IDF over the searched chunks),
+    each matching content term counts by its rarity instead of a flat 1.
+    """
+    query_terms = _query_terms(query)
 
     if not query_terms:
         return 0.0
@@ -131,11 +204,18 @@ def _lexical_score(
     tag_terms = _tokenize(tags)
     content_terms = _tokenize(chunk.text)
 
+    content_matches = query_terms & content_terms
+
+    if weights is None:
+        content_score = float(len(content_matches))
+    else:
+        content_score = sum(weights.get(term, 1.0) for term in content_matches)
+
     score = (
         4 * len(query_terms & title_terms)
         + 3 * len(query_terms & tag_terms)
         + 2 * len(query_terms & id_terms)
-        + len(query_terms & content_terms)
+        + content_score
     )
 
     query_lower = query.strip().lower()
@@ -297,8 +377,10 @@ def _lexical_search(
         tuple[float, KnowledgeBaseChunk]
     ] = []
 
+    weights = _term_weights(chunks)
+
     for chunk in chunks:
-        score = _lexical_score(query, chunk)
+        score = _lexical_score(query, chunk, weights)
 
         if score > 0:
             scored.append((score, chunk))
@@ -478,18 +560,47 @@ def _apply_policy(
     exception = kb_precedence.verified_exception(department, policy)
 
     if exception is not None and exception.get("source"):
-        source_id = str(exception["source"][0]).upper()
+        name = str(exception["department"])
+        # Department metadata can describe unrelated subjects (for example,
+        # Engineering's software exception must not enter a VPN answer).
+        # Pin only when the query overlaps the exception's actual rule/topic.
+        query_terms = _query_terms(query)
+        rule_terms = _query_terms(str(exception.get("rule", "")))
+        relevant = bool(query_terms & rule_terms)
 
-        if source_id not in present:
-            name = str(exception["department"])
-            pin(
-                _pick_chunk(
-                    _pool_candidates(pool, source_id, department, policy),
-                    query,
-                    [f"**{name}**", name],
-                ),
-                f"department_exception:{name}",
-            )
+        if name.lower() == "finance" and re.search(
+            r"\b(?:vpn|nakhlaconnect|gateway|gw-\d|client|remote\s+access)\b",
+            query,
+            re.IGNORECASE,
+        ):
+            relevant = True
+        elif name.lower() == "contractors" and re.search(
+            r"\b(?:vpn|nakhlaconnect|gateway|gw-\d|client|remote\s+work|vdi)\b",
+            query,
+            re.IGNORECASE,
+        ):
+            relevant = True
+        elif name.lower() == "engineering" and re.search(
+            r"\b(?:ubuntu|linux|admin|elevat|software\s+center|install|"
+            r"software|developer)\b", query, re.IGNORECASE
+        ):
+            relevant = True
+
+        if relevant:
+            for source in exception["source"]:
+                source_id = str(source).upper()
+
+                if source_id not in present:
+                    pin(
+                        _pick_chunk(
+                            _pool_candidates(pool, source_id, department, policy),
+                            query,
+                            [f"**{name}**", name],
+                        ),
+                        f"department_exception:{name}",
+                    )
+                    if source_id in present:
+                        break
 
     return kept + extras
 

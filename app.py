@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import json
 import logging
@@ -25,6 +26,7 @@ from mcp.types import CallToolResult, Tool
 
 from services.approval_store import ApprovalStoreError, SQLiteApprovalStore
 from services import chat_memory
+from services import guardrails_service
 from services import ticket_intelligence
 from services.local_ticket_store import (
     SQLiteTicketMetadataStore,
@@ -139,6 +141,9 @@ def _requests_ticket_creation(message: str) -> bool:
     return False
 
 logger = logging.getLogger(__name__)
+
+if os.getenv("HELPDESK_PIPELINE_DIAGNOSTICS") == "1":
+    logger.setLevel(logging.INFO)
 
 TICKET_SCHEMA_PATH = (
     Path(__file__).resolve().parent
@@ -1451,6 +1456,20 @@ async def chat(request: ChatRequest):
             "state": "test_draft_pending",
         }
 
+    input_check = await asyncio.to_thread(
+        guardrails_service.guard_input, request.message
+    )
+
+    if not input_check.passed:
+        return {
+            "reply": input_check.text,
+            "pending_action": None,
+            "citations": [],
+            "tool_calls": [],
+            "result": {},
+            "state": "blocked_by_guardrails",
+        }
+
     try:
         intake = _begin_or_continue_ticket_intake(request)
 
@@ -2067,6 +2086,13 @@ async def _draft_ticket_response(
         "kb_refs": kb_refs,
     }
 
+    logger.info(
+        "Ticket draft staged: category=%s priority=%s kb_refs=%s; approval_required=true",
+        category,
+        priority,
+        sorted(kb_refs),
+    )
+
     if affected_users is not None:
         payload["affected_users"] = affected_users
 
@@ -2310,6 +2336,12 @@ async def approve(
             http_request.app.state, request.session_id, record
         )
     try:
+        logger.info(
+            "Explicit ticket approval accepted; invoking create_ticket for category=%s priority=%s kb_refs=%s",
+            payload.get("category"),
+            payload.get("priority"),
+            sorted(payload.get("kb_refs", [])),
+        )
         tool_result = (
             await http_request.app.state.mcp.create_approved_ticket(
                 authorization
@@ -2383,6 +2415,10 @@ async def approve(
             result=ticket_result,
             tool_calls=created_call,
         )
+
+    logger.info(
+        "Approved ticket creation completed: system_recorded=true local_reference_recorded=true",
+    )
 
     return _approval_response(
         f"Ticket {ticket_result['ticket_id']} was created.",

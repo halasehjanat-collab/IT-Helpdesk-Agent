@@ -70,8 +70,16 @@ def test_multiple_chunks_of_one_source_give_one_citation(run):
     assert ids(result) == ["KB-002"]
 
 
-def test_reply_without_citation_ids_returns_none(run):
-    assert run([chunk("KB-002")], "Restart the VPN client.")["citations"] == []
+def test_verified_reply_without_citation_marker_uses_its_matched_source(run):
+    result = run([chunk("KB-002")], "Restart the VPN client.")
+    assert ids(result) == ["KB-002"]
+    assert "[KB-002]" in result["reply"]
+
+
+def test_unverified_reply_without_citation_ids_returns_none(run):
+    result = run([chunk("KB-002")], "Reinstall the laptop motherboard firmware.")
+    assert result["citations"] == []
+    assert "couldn't verify" in result["reply"]
 
 
 def test_cited_id_that_was_not_retrieved_is_rejected(run):

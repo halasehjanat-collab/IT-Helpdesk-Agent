@@ -19,7 +19,7 @@ against the original.
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 copy .env.example .env                                  # then fill in OPENROUTER_API_KEY
 
 uvicorn services.helpdesk_api:app --port 8102           # terminal 1: the helpdesk API
@@ -32,7 +32,7 @@ Docker instead of uvicorn: `docker compose up --build` (same API on port 8102).
 
 One venv is enough for the kit **and** your agent: `requirements.txt` also pins the course's agent
 framework (`langgraph==1.2.10`, `openai==2.52.0`) and `mcp==1.28.1`, the MCP version CrewAI 1.15 needs.
-Already have the course's Module 2 venv? `pip install -r requirements.txt` into it works too.
+`requirements-dev.txt` adds pytest. For a runtime-only install, use `pip install -r requirements.txt`.
 
 ## Layout
 
@@ -302,6 +302,40 @@ separate from the ticket and approval databases.
   and anyone who knows a session ID could read or delete that session's memory, as with its
   pending approvals. There is no cross-session personalization.
 - **Tests:** `python -m pytest -q` (offline; uses temporary databases only).
+
+## Guardrails AI
+
+`services/guardrails_service.py` uses the real `guardrails-ai` framework (`Guard` plus custom
+`Validator`s, pinned to 0.10.0; never 0.10.1, which was a malicious release). It adds a layer; the
+Answer Verifier, KB precedence, citation checks, memory, approval gate and tool-boundary
+authorization are unchanged and still run.
+
+| Guard | Runs | Validators |
+|---|---|---|
+| input | `/api/chat` before ticket intake or tools, and again at the start of `run_agent` | `PromptInjection`, `SecretRequest`, `PrivilegeClaim` (incl. approval bypass), `OtherUserData` |
+| context | on every retrieved chunk before it can reach the model | `PromptInjection` (same rules as `answer_verifier.looks_like_injection`) |
+| output | after the Answer Verifier, before the reply is returned | `SecretLeak`, `PersonalData`, `GroundedIdentifiers`, `Citations`, `EvidenceAndPolicy` |
+
+- **All checks are deterministic** (regex rules, the manifest and the existing verifier). No model-based or
+  Guardrails Hub validator is used, so no extra API key, hosted service or network call is needed.
+  Framework telemetry is switched off in code.
+- **Failure handling:** a blocked input returns a fixed refusal (`state: "blocked_by_guardrails"`) and
+  nothing else runs. A failed output is replaced by a fixed fallback that never repeats the blocked text
+  (a secret or contact leak gets "I can't share that information"; unsupported content gets the usual
+  honest fallback). A fabricated `[ID]` marker is removed if the rest still passes. An exception,
+  timeout (`GUARDRAILS_TIMEOUT_SECONDS`, default 5) or malformed value fails closed; the message is not
+  logged.
+- **Authorization is not decided by text.** The input guard only refuses unmistakable bypass attempts.
+  Access to tickets is still enforced at `/api/tickets`/MCP and the approval gate. There is still no
+  authentication, so a claimed identity is never trusted.
+- **Limits:** regex rules can be evaded by rephrasing and may block unusual legitimate wording; the app's
+  own ticket-draft replies are not passed through the output guard; the guard cannot prove an answer
+  true, only that it is consistent with the retrieved evidence.
+- **Install/test:** `pip install -r requirements-dev.txt`, then `python -m pytest tests/test_guardrails.py -q`.
+  Tests use deterministic checks and test doubles where framework invocation needs isolation; no API key
+  or Guardrails Hub service is needed. The compatible pins use Guardrails AI 0.10.0, Gradio 5.50.0,
+  Pydantic 2.12.3, and Hugging Face Hub 0.36.0. Gradio 6.30 conflicts with Guardrails 0.10.0's
+  declared `click<=8.2.0` and `typer<0.20` constraints; these pins were resolved and checked together.
 
 ## Environment variables
 

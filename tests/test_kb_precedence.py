@@ -318,6 +318,19 @@ def test_verified_finance_department_gets_its_exception_chunk_and_rule(search):
     assert any("Verified requester department: Finance" in n and "Security Operations" in n for n in notes)
 
 
+def test_engineering_exception_is_not_pinned_for_unrelated_vpn_query(search):
+    chunks = [
+        make_chunk("KB-002", "VPN gateway troubleshooting guide.", 0),
+        make_chunk("KB-016", "| **Engineering** | Ubuntu 22.04; use Software Center > Elevate for temporary local admin |", 1),
+    ]
+    results = search(chunks, "VPN NX-503 gateway error", department="Engineering")
+
+    assert not any(
+        item.metadata.get("policy_reason") == "department_exception:Engineering"
+        for item in results
+    )
+
+
 def test_contractor_gets_vdi_exception_instead_of_vpn_article(search):
     chunks = [
         make_chunk("KB-002", "VPN client troubleshooting steps.", 0),

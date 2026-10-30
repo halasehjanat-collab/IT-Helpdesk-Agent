@@ -38,6 +38,10 @@ ABSTENTION = (
     "base. I can help you escalate this issue to the Service Desk."
 )
 PARTIAL_NOTE = (
+    "Other details could not be confirmed from the knowledge base, so they "
+    "were left out. I can help you escalate this issue to the Service Desk."
+)
+_LEGACY_PARTIAL_NOTE = (
     "Some details could not be verified from the knowledge base and are "
     "not confirmed. I can help you escalate this issue to the Service Desk."
 )
@@ -74,7 +78,7 @@ def strip_notices(text: str) -> str:
 
     cleaned = "\n".join(kept)
 
-    for notice in (PARTIAL_NOTE, ABSTENTION):
+    for notice in (PARTIAL_NOTE, _LEGACY_PARTIAL_NOTE, ABSTENTION):
         cleaned = cleaned.replace(notice, "")
 
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
@@ -213,6 +217,23 @@ _NEGATION = re.compile(
 
 def _negated(text: str) -> bool:
     return _NEGATION.search(text) is not None
+
+
+# Claims that something does not exist are never implied by silence: a source
+# must state the absence itself.
+_ABSENCE = re.compile(
+    r"\b(?:there\s+(?:is|are|was|were)\s+(?:no|not)|(?:does|do|did)\s*(?:n't|not)\s+"
+    r"(?:exist|have)|(?:doesn't|don't|didn't)\s+(?:exist|have)|no\s+such|"
+    r"(?:is|are)\s*(?:n't|not)\s+(?:available|installed|provided|offered|"
+    r"supported|present)|(?:isn't|aren't)\s+(?:available|installed|provided|"
+    r"offered|supported|present|any)|(?:has|have)\s+no\b|"
+    r"(?:no|not)\s+\w+(?:\s+\w+){0,3}\s+(?:exists?|available|installed))\b",
+    re.IGNORECASE,
+)
+
+
+def _absence_claim(text: str) -> bool:
+    return _ABSENCE.search(text) is not None
 
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`\"\[(*#])")
@@ -376,6 +397,7 @@ class _Context:
     policy: kb_precedence.KBPolicy | None
     message_norm: str
     min_coverage: float
+    department: str | None = None
 
 
 def _build_doc(document: dict[str, Any], doc_id: str) -> _Doc:
@@ -447,15 +469,19 @@ def _supporting_ids(
         return agreeing, False, False
 
     needed = min(MIN_SHARED_STEMS, len(claim_stems))
-
+    # A priority label must come from the passage that supports the claim, not
+    # from another row of the same table (4 users is P1, never P2).
+    priority_labels = set(re.findall(r"\bp[1-4]\b", claim_text.lower()))
     for doc in docs:
-        for _, stems, negated in doc.windows:
+        for window, stems, negated in doc.windows:
             shared = claim_stems & stems
+            window_labels = set(re.findall(r"\bp[1-4]\b", window.lower()))
 
             if (
                 len(shared) < needed
                 or len(shared) / len(claim_stems) < ctx.min_coverage
                 or (action is not None and action not in stems)
+                or not priority_labels <= window_labels
             ):
                 continue
 
@@ -630,6 +656,30 @@ def _evaluate_sentence(
 
     is_negative = _negated(sentence)
 
+    restriction = kb_precedence.department_restriction(
+        sentence, ctx.department, ctx.policy, context=ctx.message_norm
+    )
+
+    if restriction:
+        return ClaimResult(sentence, REJECTED, (restriction,))
+
+    # Citing a document that loses a manifest conflict on this topic is never
+    # allowed, even in a sentence that otherwise only points to the Service Desk.
+    if ctx.policy is not None and cited:
+        sentence_terms = set(re.findall(r"[a-z0-9]+", analysis.lower()))
+
+        for conflict in ctx.policy.conflicts:
+            lost = sorted(cited & set(conflict.losers))
+            needed_terms = min(2, len(conflict.terms))
+
+            if (
+                lost
+                and needed_terms
+                and len(sentence_terms & conflict.terms) >= needed_terms
+            ):
+                return ClaimResult(
+                    sentence, REJECTED, (f"conflict_loser:{lost[0]}",)
+                )
     if _CREDENTIAL_REQUEST.search(sentence) and not is_negative:
         return ClaimResult(
             sentence, REJECTED, ("credential_request",)
@@ -669,6 +719,15 @@ def _evaluate_sentence(
             )
 
     all_chunks = _evidence(ctx, None)
+
+    if _absence_claim(sentence) and not any(
+        _absence_claim(window)
+        and len(_stems(analysis) & stems_) >= min(MIN_SHARED_STEMS, len(_stems(analysis)))
+        for doc in all_chunks
+        for window, stems_, _ in doc.windows
+    ):
+        return ClaimResult(sentence, UNVERIFIED, ("unsupported_absence_claim",))
+
     lost_by_id: dict[str, str] = {}
 
     for doc in all_chunks:
@@ -882,13 +941,16 @@ def verify_answer(
     message: str = "",
     policy_notes: list[str] | None = None,
     policy: kb_precedence.KBPolicy | None = None,
+    department: str | None = None,
 ) -> VerifiedAnswer:
     """Verify a model reply against retrieved chunks. Never raises."""
     if not isinstance(reply, str) or not reply.strip():
         return VerifiedAnswer(reply if isinstance(reply, str) else "", "no_claims")
 
     try:
-        return _verify(reply, documents or [], message, policy_notes, policy)
+        return _verify(
+            reply, documents or [], message, policy_notes, policy, department
+        )
     except Exception:
         logger.exception("Answer verification failed; failing closed")
         return _abstain((), "verifier_error")
@@ -920,12 +982,33 @@ def _renumber(lines: list[str]) -> list[str]:
     return result
 
 
+_CITE_ONLY = re.compile(r"\s*(?:\[[A-Za-z]{2}-\d+(?:\s*,\s*[A-Za-z]{2}-\d+)*\]\s*)+")
+
+
+def _merge_trailing_cites(sentences: list[str]) -> list[str]:
+    """Attach a citation written after the final period to its sentence."""
+    merged: list[str] = []
+
+    for sentence in sentences:
+        if (
+            merged
+            and not _HEADING.match(merged[-1])
+            and _CITE_ONLY.fullmatch(sentence)
+        ):
+            merged[-1] = f"{merged[-1]} {sentence.strip()}"
+        else:
+            merged.append(sentence)
+
+    return merged
+
+
 def _verify(
     reply: str,
     documents: list[dict[str, Any]],
     message: str,
     policy_notes: list[str] | None,
     policy: kb_precedence.KBPolicy | None,
+    department: str | None = None,
 ) -> VerifiedAnswer:
     if policy is None:
         try:
@@ -940,6 +1023,7 @@ def _verify(
         return VerifiedAnswer(original_reply, "no_claims")
 
     ctx = _build_context(documents, str(message or ""), policy)
+    ctx.department = department
     lines = reply.splitlines()
     output: list[str] = []
     unverified: list[str] = []
@@ -990,7 +1074,7 @@ def _verify(
         body = line[len(marker):]
         parts: list[str] = []
 
-        for sentence in _split_sentences(body):
+        for sentence in _merge_trailing_cites(_split_sentences(body)):
             heading: str | None = None
 
             if _HEADING.match(sentence):
@@ -1041,15 +1125,16 @@ def _verify(
     if not changed:
         return VerifiedAnswer(reply, "supported", claims)
 
+    # Unsupported sentences are dropped, never re-shown as a second section.
     body = "\n".join(_renumber(output)).strip()
 
-    if unverified:
-        body += (
-            f"\n\n{UNVERIFIED_HEADER}\n"
-            + "\n".join(f"- {text}" for text in dict.fromkeys(unverified))
-        )
-
     if unverified_count or rejected:
+        # A citation left alone on a line belonged to a removed sentence.
+        body = "\n".join(
+            line
+            for line in body.splitlines()
+            if not re.fullmatch(r"\s*(?:\[[A-Za-z]{2}-\d+\]\s*)+", line)
+        ).strip()
         body += f"\n\n{PARTIAL_NOTE}"
         return VerifiedAnswer(body, "partial", claims)
 

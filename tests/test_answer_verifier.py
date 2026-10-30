@@ -71,8 +71,8 @@ def test_mixed_answer_is_partial_and_keeps_supported_lines():
     result = verify(reply)
     assert result.status == "partial"
     assert "Reset Profile [KB-002]" in result.reply
-    assert av.UNVERIFIED_HEADER in result.reply
-    assert "firmware [KB-002]" not in result.reply
+    assert av.UNVERIFIED_HEADER not in result.reply
+    assert "firmware" not in result.reply
     assert av.PARTIAL_NOTE in result.reply
 
 
@@ -385,9 +385,9 @@ def test_supported_claim_followed_by_unsupported_action_is_partial():
     result = verify(reply, [doc("KB-002", FIREWALL_TEXT)])
     assert result.status == "partial"
     assert "Restart the VPN client and sign in again [KB-002]" in result.reply
-    assert result.reply.count("disable the firewall") == 1
-    assert av.UNVERIFIED_HEADER in result.reply
-    assert "firewall [KB-002]" not in result.reply
+    assert "firewall" not in result.reply
+    assert av.UNVERIFIED_HEADER not in result.reply
+    assert av.PARTIAL_NOTE in result.reply
 
 
 def test_negation_is_kept_across_conjoined_clauses():
@@ -419,14 +419,15 @@ def test_instruction_inside_uncertainty_or_escalation_is_verified(reply):
     assert result.claims and result.claims[0].verdict != av.SUPPORTED
 
 
-def test_unsupported_instruction_in_shield_is_labelled_not_confirmed():
+def test_unsupported_instruction_in_shield_is_dropped_and_noted():
     reply = (
         "Restart the VPN client and sign in again [KB-002]. "
         "I can't confirm this, but disable the firewall."
     )
     result = verify(reply, [doc("KB-002", FIREWALL_TEXT)])
     assert result.status == "partial"
-    assert av.UNVERIFIED_HEADER in result.reply
+    assert "firewall" not in result.reply
+    assert av.PARTIAL_NOTE in result.reply
     assert "shielded_instruction" in reasons_of(result)
 
 

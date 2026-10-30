@@ -20,10 +20,13 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from services import answer_verifier, kb_precedence
+from services import answer_verifier, guardrails_service, kb_precedence
 from services.kb_retriever import retrieve_chunks
 
 logger = logging.getLogger(__name__)
+
+if os.getenv("HELPDESK_PIPELINE_DIAGNOSTICS") == "1":
+    logger.setLevel(logging.INFO)
 
 load_dotenv()
 
@@ -408,6 +411,49 @@ def select_citations(
     return citations
 
 
+def _attach_verified_citations(
+    reply: str,
+    claims: tuple[answer_verifier.ClaimResult, ...],
+    documents: list[dict[str, Any]],
+    department: str | None,
+) -> str:
+    """Cite claims using only the eligible retrieved sources that verified them.
+
+    The model is not the authority on provenance: each source below comes from
+    the verifier's matched evidence, then is checked against the actual
+    retrieved document set and department applicability before being attached.
+    """
+    cited_reply = reply
+    policy = kb_precedence.load_policy()
+    eligible_ids = {
+        kb_precedence.document_id(document)
+        for document in documents
+        if kb_precedence.is_eligible(document, policy)
+        and kb_precedence.applies_to_department(document, department, policy)
+    }
+
+    for claim in claims:
+        if claim.verdict != answer_verifier.SUPPORTED or not claim.sources:
+            continue
+
+        text = claim.text.strip()
+        sources = [source for source in claim.sources if source in eligible_ids]
+        if not text or not sources:
+            continue
+
+        markers = " ".join(f"[{source}]" for source in sources)
+        if any(re.search(rf"\[{re.escape(source)}\]", text) for source in sources):
+            continue
+
+        # Keep the evidence citation attached to the exact verified claim.
+        position = cited_reply.find(text)
+        if position >= 0:
+            end = position + len(text)
+            cited_reply = cited_reply[:end] + f" {markers}" + cited_reply[end:]
+
+    return cited_reply
+
+
 def _clean_history(
     history: list[dict[str, str]] | None,
 ) -> list[dict[str, str]]:
@@ -555,8 +601,18 @@ never say that ticket drafting is unavailable.
 Never request passwords, MFA codes, API keys, or other secrets.
 
 Cite relevant source IDs in the answer, for example [KB-003] or [SP-002].
+Only cite document IDs included in the supplied context. Do not cite a source
+merely because another supplied document mentions or refers to it.
 Do not claim that a source supports a statement unless its supplied
 content does so.
+
+Write only statements that the supplied documents state. Do not add
+general troubleshooting advice, extra steps, URLs, commands, response-time
+or resolution targets, or background that the documents do not contain.
+Never say that a device, printer, service, or procedure does not exist
+because the documents do not mention it; say only that the documents do
+not cover it. When the documents answer only part of the question,
+answer that part and stop.
 """.strip()
 
     messages: list[dict[str, str]] = [
@@ -586,7 +642,7 @@ content does so.
         completion = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            temperature=0.2,
+            temperature=0,
         )
 
         reply = (
@@ -730,6 +786,30 @@ def _small_talk_reply(message: str) -> str | None:
     return _GREETING_REPLY
 
 
+def _with_department_rule(
+    reply: str,
+    department: str | None,
+    retrieved_ids: set[str],
+    replace: bool,
+) -> str:
+    """State the verified department's manifest rule after a forbidden step."""
+    guidance = kb_precedence.department_guidance(department)
+
+    if guidance is None:
+        return reply
+
+    rule, sources = guidance
+    cites = " ".join(f"[{s}]" for s in sources if s in retrieved_ids)
+    line = f"For {str(department).strip()} staff: {rule} {cites}".strip()
+
+    if replace:
+        return line
+
+    # The generic "escalate to the Service Desk" note would contradict the
+    # department's own routing, so the rule replaces it.
+    return f"{answer_verifier.strip_notices(reply)}\n\n{line}"
+
+
 async def run_agent(
     message: str,
     history: list[dict[str, str]] | None = None,
@@ -745,6 +825,21 @@ async def run_agent(
 
     cleaned_message = message.strip()
     conversation_history = _clean_history(history)
+
+    input_check = await asyncio.to_thread(
+        guardrails_service.guard_input, cleaned_message
+    )
+
+    if not input_check.passed:
+        return {
+            "answer": input_check.text,
+            "reply": input_check.text,
+            "citations": [],
+            "tool_calls": [],
+            "pending_action": None,
+            "usage": None,
+            "state": "blocked_by_guardrails",
+        }
 
     small_talk = _small_talk_reply(cleaned_message)
 
@@ -818,8 +913,21 @@ async def run_agent(
 
         documents.append(document)
 
+    retrieved_ids = sorted(
+        {kb_precedence.document_id(document) for document in documents}
+    )
+
     # Chunks that address the AI instead of the reader are data, not evidence.
-    documents, quarantined = answer_verifier.quarantine_documents(documents)
+    documents, quarantined = await asyncio.to_thread(
+        guardrails_service.filter_documents, documents
+    )
+
+    logger.info(
+        "Answer evidence context: retrieved_ids=%s generator_ids=%s quarantined_ids=%s",
+        retrieved_ids,
+        sorted({kb_precedence.document_id(document) for document in documents}),
+        sorted(set(quarantined)),
+    )
 
     if quarantined:
         logger.warning(
@@ -842,22 +950,67 @@ async def run_agent(
         **generation_kwargs,
     )
 
+    logger.info(
+        "Answer generation: response_kind=%s reply_chars=%d response_marker_ids=%s",
+        "model" if model_answered else "fallback",
+        len(reply),
+        sorted({match.upper() for match in _CITATION_ID_PATTERN.findall(reply)}),
+    )
+
     if model_answered:
         verified = answer_verifier.verify_answer(
             reply,
             documents,
             message=cleaned_message,
             policy_notes=notes,
+            department=retrieval_kwargs.get("department"),
         )
-        reply = verified.reply
+        reply = _attach_verified_citations(
+            verified.reply,
+            verified.claims,
+            documents,
+            retrieval_kwargs.get("department"),
+        )
         logger.info(
             "Answer verification: status=%s supported=%d unverified=%d "
-            "rejected=%d",
+            "rejected=%d verified_sources=%s",
             verified.status,
             verified.count(answer_verifier.SUPPORTED),
             verified.count(answer_verifier.UNVERIFIED),
             verified.count(answer_verifier.REJECTED),
+            sorted({source for claim in verified.claims for source in claim.sources}),
         )
+        guarded = await asyncio.to_thread(
+            guardrails_service.guard_output,
+            reply,
+            documents=documents,
+            message=cleaned_message,
+            department=retrieval_kwargs.get("department"),
+            policy_notes=notes,
+            model_answered=True,
+            verification_status=verified.status,
+            has_citations=bool(
+                select_citations(reply, documents, True)
+            ),
+        )
+
+        if not guarded.passed:
+            reply = guarded.text
+            verified = answer_verifier.VerifiedAnswer(
+                reply, "abstained", verified.claims
+            )
+
+        if any(
+            reason.startswith("department_restriction")
+            for claim in verified.claims
+            for reason in claim.reasons
+        ):
+            reply = _with_department_rule(
+                reply,
+                retrieval_kwargs.get("department"),
+                {str(d.get("id")) for d in documents},
+                verified.status == "abstained",
+            )
 
     citations = select_citations(reply, documents, model_answered)
 

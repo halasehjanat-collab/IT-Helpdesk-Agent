@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Deterministic test suite for the backend and UI contract.
+pytest==9.2.0

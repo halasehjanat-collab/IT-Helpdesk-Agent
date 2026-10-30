@@ -333,6 +333,99 @@ def verified_exception(
     return policy.department_exceptions.get(department.strip().lower())
 
 
+_VPN_CONTEXT = re.compile(
+    r"\b(?:vpn|nakhlaconnect|gateway|gw-\d|client)\b", re.IGNORECASE
+)
+_VDI_CONTEXT = re.compile(r"\b(?:vdi|workspace)\b", re.IGNORECASE)
+_NEGATED = re.compile(
+    r"\b(?:not|no|never|cannot|without|must not)\b|n't\b", re.IGNORECASE
+)
+
+# Instructions that a department exception forbids (KB-016, KB-002, SP-002).
+# They are enforced only for a department found in the manifest exceptions.
+_FINANCE_FORBIDDEN = re.compile(
+    r"\b(?:switch|change|select|choose|move)\b.{0,40}\b(?:gateway|gw-\d)\b|"
+    r"\b(?:re-?install|uninstall|update|upgrade|re-?configure|edit|modify|"
+    r"download|install)\b.{0,50}"
+    r"\b(?:client|nakhlaconnect|vpn|client\.ini|profile)\b",
+    re.IGNORECASE,
+)
+_FINANCE_ALLOWED_ACTION = re.compile(
+    r"\b(?:check|view|visit)\b.{0,30}\bstatus\s+page\b|"
+    r"\b(?:security\s+operations|security\s+ticket)\b|"
+    r"\b(?:p[12]|priority\s+p[12])\b",
+    re.IGNORECASE,
+)
+_VPN_TROUBLESHOOTING_ACTION = re.compile(
+    r"\b(?:approve|accept|enter|type|request|join|enrol|enroll|"
+    r"reset|restart|reboot|clear|flush|connect|disconnect|"
+    r"run|open|launch|reinstall|uninstall|update|upgrade|"
+    r"re-?configure|edit|modify|download|install|switch|change|"
+    r"select|choose|move|troubleshoot|try|use)\b",
+    re.IGNORECASE,
+)
+
+
+def department_restriction(
+    sentence: str,
+    department: str | None,
+    policy: KBPolicy | None = None,
+    context: str = "",
+) -> str | None:
+    """Reason code when a sentence instructs something this department may not do.
+
+    Only a verified department with a manifest exception is considered. Negated
+    sentences ("Do not switch gateway") are statements of the restriction itself.
+    """
+    try:
+        exception = verified_exception(department, policy)
+    except KBPolicyError:
+        return None
+
+    if exception is None or _NEGATED.search(sentence):
+        return None
+
+    name = str(exception["department"]).strip().lower()
+    topic_context = f"{sentence} {context}"
+
+    if name == "finance" and _VPN_CONTEXT.search(topic_context):
+        if re.search(r"security operations", sentence, re.IGNORECASE):
+            return None
+
+        if _FINANCE_FORBIDDEN.search(sentence):
+            return "department_restriction:Finance"
+
+        if (
+            _VPN_TROUBLESHOOTING_ACTION.search(sentence)
+            and not _FINANCE_ALLOWED_ACTION.search(sentence)
+        ):
+            return "department_restriction:Finance"
+
+    if (
+        name == "contractors"
+        and re.search(r"\b(?:vpn|nakhlaconnect)\b", sentence, re.IGNORECASE)
+        and not _VDI_CONTEXT.search(sentence)
+    ):
+        return "department_restriction:Contractors"
+
+    return None
+
+
+def department_guidance(
+    department: str | None,
+    policy: KBPolicy | None = None,
+) -> tuple[str, list[str]] | None:
+    """The manifest rule and its source ids for a verified department."""
+    exception = verified_exception(department, policy)
+
+    if exception is None:
+        return None
+
+    return str(exception.get("rule", "")).strip(), _as_list(
+        exception.get("source")
+    )
+
+
 def precedence_notes(
     document_ids: Iterable[str],
     department: str | None = None,

@@ -8,7 +8,7 @@ uvicorn==0.52.1
 jsonschema==4.26.0
 httpx==0.28.1
 mcp==1.28.1
-pydantic==2.12.5
+pydantic==2.12.3
 # pydantic-settings 2.15+ makes mcp 1.28.1 print a harmless IncompleteFieldDefinitionWarning
 pydantic-settings==2.14.2
 
@@ -17,7 +17,11 @@ PyYAML==6.0.3
 pymupdf==1.28.2
 
 # UI starter (ui/app_ui.py)
-gradio==6.30.0
+# Gradio 6 requires huggingface-hub>=1.16, which requires click>=8.4 and typer>=0.20.
+# Guardrails AI 0.10.0 (the maintainer-declared safe release) requires click<=8.2 and typer<0.20.
+# Gradio 5.50 remains API-compatible with this UI and supports the shared constraints.
+gradio==5.50.0
+huggingface-hub==0.36.0
 
 # Retrieval helpers: .env loading and vector math (a Module 6 style store)
 python-dotenv==1.2.4
@@ -28,3 +32,11 @@ numpy==2.5.4
 # (chat + embeddings). evals/run_evals.py --judge also uses openai.
 langgraph==1.2.10
 openai==2.52.0
+
+# Guardrails AI (input/context/output guards, services/guardrails_service.py).
+# 0.10.1 was a malicious release (GHSA-xmpw-2vmm-p4p6 / CVE-2026-45758); 0.10.0 is
+# the version the project's advisory names as clean. Never pin 0.10.1.
+# pip metadata warns "guardrails-ai requires typer<0.20" because gradio 6.30 needs
+# huggingface-hub>=1.16, which needs typer>=0.20. Only guardrails' CLI uses typer;
+# the library import used here works (verified by tests/test_guardrails.py).
+guardrails-ai==0.10.0

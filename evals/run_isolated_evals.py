@@ -103,10 +103,17 @@ def write_combined(results: list[dict], started: float, out_md: Path = OUT_MD) -
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only")
+    parser.add_argument(
+        "--pipeline-diagnostics",
+        action="store_true",
+        help="Enable safe stage logs (document IDs, verdicts, ticket metadata; no answer or requester text).",
+    )
     options, passthrough = parser.parse_known_args(argv)
 
     tmp = Path(tempfile.mkdtemp(prefix="helpdesk-eval-"))
     env = isolated_env(tmp)
+    if options.pipeline_diagnostics:
+        env["HELPDESK_PIPELINE_DIAGNOSTICS"] = "1"
     procs: list[subprocess.Popen] = []
     results: list[dict] = []
     started = time.time()
@@ -118,7 +125,8 @@ def main(argv: list[str]) -> int:
             procs.append(
                 subprocess.Popen(
                     [sys.executable, "-m", "uvicorn", module,
-                     "--port", str(port), "--log-level", "warning"],
+                     "--port", str(port), "--log-level",
+                     "info" if options.pipeline_diagnostics else "warning"],
                     cwd=ROOT,
                     env=env,
                 )
