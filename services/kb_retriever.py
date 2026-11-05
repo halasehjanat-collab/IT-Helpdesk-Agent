@@ -11,7 +11,6 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
-from dotenv import load_dotenv
 from openai import OpenAI
 
 from services import kb_precedence
@@ -20,8 +19,9 @@ from services.kb_ingestion import (
     chunk_documents,
     load_knowledge_base,
 )
+from services.runtime_config import load_project_environment, openrouter_api_key
 
-load_dotenv()
+load_project_environment()
 
 OPENROUTER_BASE_URL = os.getenv(
     "OPENROUTER_BASE_URL",
@@ -95,12 +95,7 @@ def _tokenize(text: str) -> set[str]:
 
 
 _STOPWORDS = frozenset(
-    "a an and any are as at be been but by can could did do does for from "
-    "get got had has have how i if in into is it its me my no not of on or "
-    "our should so that the their them then there these they this to up us "
-    "was we were what when where which who why will with would you your "
-    "am im ive about also just please help need want still again keeps "
-    "tried try trying know".split()
+    ["a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do", "does", "for", "from", "get", "got", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "should", "so", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your", "am", "im", "ive", "about", "also", "just", "please", "help", "need", "want", "still", "again", "keeps", "tried", "try", "trying", "know"]
 )
 
 
@@ -240,7 +235,7 @@ def _lexical_score(
 
 def _openrouter_client() -> OpenAI | None:
     """Create an OpenRouter client if an API key is configured."""
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = openrouter_api_key()
 
     if not api_key:
         return None
@@ -572,15 +567,11 @@ def _apply_policy(
             r"\b(?:vpn|nakhlaconnect|gateway|gw-\d|client|remote\s+access)\b",
             query,
             re.IGNORECASE,
-        ):
-            relevant = True
-        elif name.lower() == "contractors" and re.search(
+        ) or name.lower() == "contractors" and re.search(
             r"\b(?:vpn|nakhlaconnect|gateway|gw-\d|client|remote\s+work|vdi)\b",
             query,
             re.IGNORECASE,
-        ):
-            relevant = True
-        elif name.lower() == "engineering" and re.search(
+        ) or name.lower() == "engineering" and re.search(
             r"\b(?:ubuntu|linux|admin|elevat|software\s+center|install|"
             r"software|developer)\b", query, re.IGNORECASE
         ):

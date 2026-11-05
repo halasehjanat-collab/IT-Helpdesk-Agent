@@ -49,6 +49,7 @@ def run(monkeypatch):
             monkeypatch.setenv("OPENROUTER_API_KEY", api_key)
         else:
             monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+            monkeypatch.setattr(agent_module, "openrouter_api_key", lambda: None)
         FakeOpenAI.reply = reply
         return asyncio.run(agent_module.run_agent("How do I fix NX-781?"))
 
@@ -100,11 +101,15 @@ def test_documents_with_invalid_metadata_are_not_cited(run):
     assert ids(result) == ["KB-004"]
 
 
-def test_model_failure_returns_no_citations(run):
-    result = run([chunk("KB-002")], RuntimeError("provider down"))
+def test_model_failure_returns_no_citations_and_logs_no_exception_message(run, caplog):
+    secret_like = "provider failure contains hidden value"
+    with caplog.at_level("WARNING", logger="agent"):
+        result = run([chunk("KB-002")], RuntimeError(secret_like))
     assert result["citations"] == []
     assert "could not connect" in result["reply"]
     assert result["usage"] is None
+    assert "RuntimeError" in caplog.text
+    assert secret_like not in caplog.text
 
 
 def test_missing_api_key_returns_no_citations(run):

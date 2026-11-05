@@ -23,3 +23,21 @@ chroma_db/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Temporary test and audit files
+.behavior-test-tmp*/
+.live-audit/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.sqlite3
+
+# Secrets and local environments
+.env
+.venv/
+node_modules/
+
+# Release hygiene
+*.zip
+dist/

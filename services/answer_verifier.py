@@ -123,18 +123,7 @@ class VerifiedAnswer:
 
 # ------------------------------------------------------------------ text tools
 
-_STOPWORDS = frozenset("""
-a an the and or but if then so to of in on at for with from by as is are was
-were be been being am do does did done doing this that these those it its you
-your yours we our us i me my they them their he she him her will would should
-could can may might must shall have has had not no also see please use using
-try first next finally there here which what when where how why who whom any
-some all each other more most just only about into over under again still
-once now example ok okay sure hello hi hey thanks thank help assist happy glad
-sorry able need want like get got make made go goes going take taking follow
-following step steps issue problem report reported seeing shows show let
-know sure ensure make error code codes means mean
-""".split())
+_STOPWORDS = frozenset(["a", "an", "the", "and", "or", "but", "if", "then", "so", "to", "of", "in", "on", "at", "for", "with", "from", "by", "as", "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "done", "doing", "this", "that", "these", "those", "it", "its", "you", "your", "yours", "we", "our", "us", "i", "me", "my", "they", "them", "their", "he", "she", "him", "her", "will", "would", "should", "could", "can", "may", "might", "must", "shall", "have", "has", "had", "not", "no", "also", "see", "please", "use", "using", "try", "first", "next", "finally", "there", "here", "which", "what", "when", "where", "how", "why", "who", "whom", "any", "some", "all", "each", "other", "more", "most", "just", "only", "about", "into", "over", "under", "again", "still", "once", "now", "example", "ok", "okay", "sure", "hello", "hi", "hey", "thanks", "thank", "help", "assist", "happy", "glad", "sorry", "able", "need", "want", "like", "get", "got", "make", "made", "go", "goes", "going", "take", "taking", "follow", "following", "step", "steps", "issue", "problem", "report", "reported", "seeing", "shows", "show", "let", "know", "sure", "ensure", "make", "error", "code", "codes", "means", "mean"])
 
 _CANON = {
     "reboot": "restart", "relaunch": "restart", "login": "signin",
@@ -143,12 +132,7 @@ _CANON = {
     "people": "user", "mobile": "phone",
 }
 
-_ACTION_VERBS = frozenset("""
-restart reboot reinstall install uninstall update upgrade reset disable
-enable delete remove clear open click select contact run connect reconnect
-turn switch request submit approve share send sign log download disconnect
-unlock change set
-""".split())
+_ACTION_VERBS = frozenset(["restart", "reboot", "reinstall", "install", "uninstall", "update", "upgrade", "reset", "disable", "enable", "delete", "remove", "clear", "open", "click", "select", "contact", "run", "connect", "reconnect", "turn", "switch", "request", "submit", "approve", "share", "send", "sign", "log", "download", "disconnect", "unlock", "change", "set"])
 
 _LEAD_WORDS = frozenset({"please", "then", "first", "next", "also", "finally"})
 
@@ -320,7 +304,14 @@ def _contains_token(evidence: str, token: str) -> bool:
         return True
 
     pattern = r"(?<![\w.@/-])" + re.escape(wanted) + r"(?![\w@-]|\.\w)"
-    return re.search(pattern, evidence) is not None
+    if re.search(pattern, evidence) is not None:
+        return True
+
+    # A bare number may be one end of a range such as 08:00-18:00 or 5-10.
+    if wanted.isdigit():
+        return re.search(pattern, re.sub(r"(?<=\d)-(?=\d)", " ", evidence)) is not None
+
+    return False
 
 
 # --------------------------------------------------------------- claim classes

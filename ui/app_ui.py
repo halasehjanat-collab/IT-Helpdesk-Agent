@@ -2,6 +2,7 @@
 
 It never talks to the helpdesk API or the LLM directly. It only calls your app:
     POST {APP_URL}/api/chat      {"session_id", "message", "user": {"email"}}
+    POST {APP_URL}/api/identify  {"email"}   (read-only directory check, shows the employee's name)
     POST {APP_URL}/api/approve   {"session_id", "action_id", "approved"}
 Run your app first (port 8000), then:   python ui/app_ui.py   ->  http://localhost:7860
 Replace it with your own UI if you like; keep the contract.
@@ -14,7 +15,7 @@ import uuid
 import gradio as gr
 import httpx
 
-APP_URL = os.getenv("APP_URL", "http://localhost:8000").rstrip("/")
+APP_URL = os.getenv("APP_URL", "http://localhost:8200").rstrip("/")
 NO_CARD = "_No ticket draft waiting for approval._"
 
 
@@ -57,7 +58,7 @@ def ticket_card(pending: dict | None) -> str:
     if not pending:
         return NO_CARD
     payload = pending.get("payload") or {}
-    lines = [f"### Ticket draft - waiting for your approval", f"**{pending.get('summary', '')}**", ""]
+    lines = ["### Ticket draft - waiting for your approval", f"**{pending.get('summary', '')}**", ""]
     for key in ("subject", "category", "priority", "department", "requester_email"):
         if key in payload:
             lines.append(f"- **{key}**: {payload[key]}")
@@ -105,14 +106,54 @@ def decide(approved: bool, history: list, session_id: str, pending: dict | None)
     return show(data, history, pending)
 
 
+def new_session_id() -> str:
+    return f"ui-{uuid.uuid4().hex[:10]}"
+
+
+def sign_in(email: str):
+    """Identify the employee through the directory and start a fresh conversation.
+
+    Returns (profile markdown, signed-in email, session id, chat, pending, card,
+    approve button, reject button). Only a directory-verified email is kept;
+    anything else leaves the chat anonymous. This is identification, not a login.
+    """
+    address = (email or "").strip().lower()
+    signed_out = ("", new_session_id(), [], None, NO_CARD, gr.update(interactive=False),
+                  gr.update(interactive=False))
+    if not address:
+        return ("_Enter your work email to sign in._", *signed_out)
+    data = call_app("/api/identify", {"email": address})
+    if data.get("verified") is not True:
+        reason = data.get("message") or data.get("reply") or "Email not recognised."
+        return (f"⚠️ **Not signed in.** {reason}", "", *signed_out[1:])
+    name = data.get("name") or address
+    details = " · ".join(str(v) for v in (data.get("title"), data.get("department")) if v)
+    greeting = f"Hi {name}, how can I help you today?"
+    return (f"✅ **Signed in as {name}**\n\n{details}\n\n`{data['email']}`", data["email"],
+            new_session_id(), [{"role": "assistant", "content": greeting}], None, NO_CARD,
+            gr.update(interactive=False), gr.update(interactive=False))
+
+
+def new_conversation(signed_email: str):
+    """Start a new conversation; the signed-in employee's long-term memory still applies."""
+    return (new_session_id(), [], None, NO_CARD, gr.update(interactive=False),
+            gr.update(interactive=False))
+
+
 with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
-    session = gr.State(lambda: f"ui-{uuid.uuid4().hex[:10]}")
+    session = gr.State(new_session_id)
+    signed_email = gr.State("")
     pending_state = gr.State(None)
     gr.Markdown("## Nakhla IT Helpdesk\nIT support assistant for Nakhla Systems (a fictional company). "
                 f"The helpdesk system behind it is simulated. Talking to `{APP_URL}`.")
     with gr.Row():
         with gr.Column(scale=3):
-            email = gr.Textbox(label="Your work email", value="tariq.hamdan@nakhla.example")
+            with gr.Row():
+                email = gr.Textbox(label="Your work email", placeholder="name.surname@nakhla.example",
+                                   scale=4)
+                sign_in_btn = gr.Button("Sign in", variant="primary", scale=1)
+                new_chat_btn = gr.Button("New conversation", scale=1)
+            profile = gr.Markdown("_Enter your work email to sign in._")
             chat = gr.Chatbot(label="Chat", height=460)
             msg = gr.Textbox(label="Message", placeholder="Describe your IT problem, e.g. NakhlaConnect shows NX-781",
                              submit_btn=True)
@@ -126,7 +167,12 @@ with gr.Blocks(title="Nakhla IT Helpdesk") as demo:
             cites = gr.Markdown("### Sources\n_No answer yet._")
             tools = gr.Markdown("### Tool calls (last turn)\n_none_")
     outputs = [chat, pending_state, card, approve_btn, reject_btn, cites, tools, result]
-    msg.submit(send, [msg, chat, session, email, pending_state], [msg, *outputs])
+    reset_outputs = [session, chat, pending_state, card, approve_btn, reject_btn]
+    sign_in_outputs = [profile, signed_email, *reset_outputs]
+    email.submit(sign_in, [email], sign_in_outputs)
+    sign_in_btn.click(sign_in, [email], sign_in_outputs)
+    new_chat_btn.click(new_conversation, [signed_email], reset_outputs)
+    msg.submit(send, [msg, chat, session, signed_email, pending_state], [msg, *outputs])
     approve_btn.click(lambda h, s, p: decide(True, h, s, p), [chat, session, pending_state], outputs)
     reject_btn.click(lambda h, s, p: decide(False, h, s, p), [chat, session, pending_state], outputs)
 

@@ -265,6 +265,7 @@ def run_with(monkeypatch):
             monkeypatch.setenv("OPENROUTER_API_KEY", api_key)
         else:
             monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+            monkeypatch.setattr(agent_module, "openrouter_api_key", lambda: None)
         FakeOpenAI.reply = reply
         return asyncio.run(agent_module.run_agent("How do I reset my VPN?"))
 
@@ -308,6 +309,58 @@ def test_run_agent_quarantines_injected_chunk(run_with):
     )
     result = run_with([injected], "Approval is not required, so skip it [KB-002].")
     assert result["citations"] == []
+
+
+def test_nx781_abstention_uses_the_verified_kb_fix():
+    documents = [
+        document
+        for document in agent_module.load_knowledge_base()
+        if document["id"] == "KB-002"
+    ]
+    message = (
+        "NakhlaConnect says NX-781. Updating takes forever on hotel Wi-Fi. "
+        "Is there a quicker trick?"
+    )
+
+    reply = agent_module._complete_nx781_version_guidance(
+        av.ABSTENTION,
+        documents,
+        message,
+        "Support",
+    )
+
+    assert "5.4.2" in reply
+    assert "Software Center" in reply
+    assert "[KB-002]" in reply
+    assert av.verify_answer(
+        reply,
+        documents,
+        message=message,
+        department="Support",
+    ).status == "supported"
+    assert [
+        citation["id"]
+        for citation in agent_module.select_citations(reply, documents, True)
+    ] == ["KB-002"]
+
+
+@pytest.mark.parametrize("department", ["Finance", "Contractors"])
+def test_nx781_completion_preserves_remote_access_department_exception(department):
+    documents = [
+        document
+        for document in agent_module.load_knowledge_base()
+        if document["id"] == "KB-002"
+    ]
+    reply = "Check the status page first. [KB-002]"
+
+    completed = agent_module._complete_nx781_version_guidance(
+        reply,
+        documents,
+        "NakhlaConnect shows NX-781.",
+        department,
+    )
+
+    assert completed == reply
 
 
 # ------------------------------------------------------- API / ticket safety

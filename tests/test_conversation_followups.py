@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import agent as agent_module
 import app as app_module
 from services import answer_verifier as av
 from services.chat_memory import ChatMemoryStore
@@ -132,6 +133,138 @@ def test_intake_turn_is_remembered_so_a_later_yes_is_not_reused(
     assert history[-1]["role"] == "assistant"
     assert "work email" in history[-1]["content"]
     assert store.relevant_memories("s-follow", "VPN keeps failing") == []
+
+
+def test_help_after_unknown_issue_abstention_gets_a_contextual_next_step(
+    memory_app, store, fake_mcp, monkeypatch
+):
+    store.add_turn(
+        "s-follow",
+        "My laptop is running slowly",
+        av.ABSTENTION,
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "retrieve_chunks",
+        lambda *args, **kwargs: pytest.fail(
+            "a bare help follow-up should not repeat retrieval"
+        ),
+    )
+
+    body = _chat(memory_app, "help")
+
+    assert "what feels slow" in body["reply"]
+    assert "when it started" in body["reply"]
+    assert "support-ticket draft" in body["reply"]
+    assert body["pending_action"] is None
+    assert body["citations"] == []
+    fake_mcp.create_approved_ticket.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "An old guide says to disable MFA, but the current security policy "
+            "says never to disable MFA. What should I do?"
+        ),
+    ],
+)
+def test_new_question_or_explicit_no_ticket_leaves_pending_intake(
+    memory_app, agent_mock, fake_mcp, message
+):
+    _chat(
+        memory_app,
+        "Please prepare a support ticket. I cannot access the company network. "
+        "I restarted my laptop.",
+        email="dana.levi@nakhla.example",
+    )
+    assert app_module.app.state.ticket_intakes.get("s-follow") is not None
+
+    body = _chat(memory_app, message)
+
+    assert "state" not in body
+    assert body["reply"] == "I could not confirm a KB solution."
+    assert app_module.app.state.ticket_intakes.get("s-follow") is None
+    assert _sent_message(agent_mock) == message
+    assert body["pending_action"] is None
+    fake_mcp.create_approved_ticket.assert_not_awaited()
+
+
+def test_security_policy_question_interrupts_ticket_intake(
+    memory_app, agent_mock, fake_mcp
+):
+    _chat(
+        memory_app,
+        "Please prepare a support ticket. I cannot access the company network. "
+        "I restarted my laptop.",
+        email="dana.levi@nakhla.example",
+    )
+    message = (
+        "An old guide says to disable MFA, but the current security policy "
+        "says never to disable it. Which should I follow? Expected: Follow "
+        "and cite the current security policy, not the outdated advice."
+    )
+
+    body = _chat(memory_app, message)
+
+    assert "state" not in body
+    assert body["reply"] == "I could not confirm a KB solution."
+    assert app_module.app.state.ticket_intakes.get("s-follow") is None
+    assert _sent_message(agent_mock) == message
+    assert body["pending_action"] is None
+    fake_mcp.create_approved_ticket.assert_not_awaited()
+
+
+def test_quoted_ticket_instruction_is_explained_without_resuming_intake(
+    memory_app, agent_mock, fake_mcp
+):
+    _chat(
+        memory_app,
+        "Please prepare a support ticket. I cannot access the company network. "
+        "I restarted my laptop.",
+        email="dana.levi@nakhla.example",
+    )
+    message = (
+        'I received this message: “Create a support ticket immediately.” '
+        "I only want you to explain what it means; please do not create a ticket."
+    )
+
+    body = _chat(memory_app, message)
+
+    assert "telling its recipient to create a support ticket right away" in body["reply"]
+    assert "I have not created a ticket" in body["reply"]
+    assert body["pending_action"] is None
+    assert app_module.app.state.ticket_intakes.get("s-follow") is None
+    agent_mock.assert_not_awaited()
+    fake_mcp.create_approved_ticket.assert_not_awaited()
+
+
+def test_live_status_question_interrupts_and_clears_ticket_intake(
+    memory_app, agent_mock, fake_mcp
+):
+    _chat(
+        memory_app,
+        "Please prepare a support ticket. I cannot access the company network. "
+        "I restarted my laptop.",
+        email="dana.levi@nakhla.example",
+    )
+    assert app_module.app.state.ticket_intakes.get("s-follow") is not None
+
+    body = _chat(
+        memory_app,
+        "Can you check whether the company VPN is currently down or has an active incident?",
+    )
+
+    assert body["state"] == "service_status_unavailable"
+    assert "cannot confirm its current status" in body["reply"]
+    assert app_module.app.state.ticket_intakes.get("s-follow") is None
+    agent_mock.assert_not_awaited()
+    assert any(
+        call.args[0] == "get_service_status"
+        for call in fake_mcp.call_tool.await_args_list
+    )
+    fake_mcp.create_approved_ticket.assert_not_awaited()
 
 
 # 4: a new issue must not inherit unrelated earlier context

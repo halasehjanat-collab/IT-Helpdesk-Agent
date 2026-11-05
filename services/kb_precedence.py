@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST_PATH = KIT_DIR / "dataset" / "manifest.json"
@@ -34,7 +35,7 @@ _WINNER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DOCUMENT_ID_PATTERN = re.compile(r"(?:KB|SP)-\d{3}", re.IGNORECASE)
-_ERROR_CODE_PATTERN = re.compile(r"\b[A-Za-z]{2,}-\d+\b")
+_ERROR_CODE_PATTERN = re.compile(r"\b([A-Za-z]{2,})-?(\d+)\b")
 _TOPIC_STOPWORDS = frozenset(
     {"the", "and", "for", "with", "you", "over", "vs", "no", "not", "of", "to"}
 )
@@ -302,8 +303,7 @@ def error_code_documents(
     policy = policy or load_policy()
     mapped: dict[str, tuple[str, ...]] = {}
 
-    for found in _ERROR_CODE_PATTERN.findall(str(query)):
-        code = found.upper()
+    for code in normalize_error_codes(query):
         ids = policy.error_codes.get(code)
 
         if not ids:
@@ -319,6 +319,22 @@ def error_code_documents(
             mapped[code] = eligible
 
     return mapped
+
+
+def normalize_error_codes(text: str) -> tuple[str, ...]:
+    """Return canonical, hyphenated forms of indexed-style error codes."""
+    return tuple(
+        f"{prefix.upper()}-{number}"
+        for prefix, number in _ERROR_CODE_PATTERN.findall(str(text))
+    )
+
+
+def normalize_error_code_text(text: str) -> str:
+    """Canonicalize error-code spelling for retrieval and prompt context."""
+    return _ERROR_CODE_PATTERN.sub(
+        lambda match: f"{match.group(1).upper()}-{match.group(2)}",
+        str(text),
+    )
 
 
 def verified_exception(

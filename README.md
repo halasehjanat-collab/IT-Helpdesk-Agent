@@ -1,6 +1,116 @@
-*Simulated systems for the IT Helpdesk Agent brief of the Agentic AI Bootcamp, organized by Jerusalem High-Tech Foundry (JHF) · in partnership with COMCEC.*
+# Nakhla IT Helpdesk Agent: grounded answers, live status and approved tickets for Nakhla Systems staff
 
-# IT Helpdesk kit
+**Nakhla employees lose time to VPN, password, printer and device problems, and guessing at the policy (Finance, contractors and others each have their own rules) creates wrong answers and duplicate tickets. This agent answers from the company knowledge base with citations, checks live service status and the employee's own tickets through read-only tools, remembers each verified employee across conversations, and drafts a support ticket that is created only after the employee approves it.**
+
+▶ **3-minute demo video:** `https://github.com/halasehjanat-collab/IT-Helpdesk-Agent` · 🧪 **Eval pass rate:** 10/10 cases (S2-01..S2-10) · 🧰 **Stack:** LangGraph · MCP · FastAPI · React (Figma UI) · `openai/gpt-4.1-mini` via OpenRouter
+
+<!-- Add a screenshot or GIF as docs/demo.gif, then: ![demo](docs/demo.gif) -->
+
+---
+
+## What it does
+
+- **Answers from the knowledge base with citations** (`[KB-002]`). The answer verifier removes claims the retrieved documents do not support, and the agent abstains instead of guessing.
+- **Applies department policy:** Finance VPN problems go to Security Operations, contractors get VDI, and source precedence resolves conflicting documents.
+- **Uses live read-only MCP tools:** `lookup_employee`, `get_service_status`, `get_ticket` and `search_tickets`. It reports ticket status only for the signed-in employee's own tickets.
+- **Remembers across conversations:** short-term history per session, long-term facts and past episodes per directory-verified employee.
+- **Asks before it acts:** a ticket is drafted, validated against `ticket.schema.json` and proposed. It is written only after you approve it.
+
+## Architecture
+
+```
+React UI (Figma) / Gradio  ──►  FastAPI app (app.py, :8000)
+                                  │  /api/identify  /api/chat  /api/approve  /api/tickets
+                                  ▼
+                      LangGraph agent (agent.py)
+   input_guard → triage → retrieve → safeguard → generate → verify → finalize
+        │            │         │                                  │
+   Guardrails    clarify /   KB hybrid RAG                 answer verifier
+   (injection,   escalate    (kb_retriever,                (citations, policy)
+    secrets)                  kb_precedence)
+                                  │
+   Memory (SQLite): short-term history + long-term facts/episodes per verified employee
+                                  │
+   MCP client (read tools only) ──► MCP server ──► simulated helpdesk API (:8102)
+                                  │
+   Approval gate: pending_action ──► /api/approve ──► create_ticket (only our code, never an LLM)
+```
+
+- **Roles/nodes:** seven LangGraph nodes, each with one job; fixed fallback replies skip the verifier.
+- **MCP:** all read tools go through one MCP client. `create_ticket` is not exposed to chat; `/api/approve` calls it with an `ApprovedTicketAuthorization`.
+- **Memory:** `services/chat_memory.py` (SQLite, owner = directory-verified email). Secrets are never stored.
+- **Guardrails and gate:** prompt-injection and secret checks run before the model; drafts are schema-validated before being registered; approval is idempotent and tied to the session.
+
+| Component | Real or simulated? | Notes |
+|---|---|---|
+| LLM (`openai/gpt-4.1-mini`) via OpenRouter | **Real** | chat and verification |
+| Embeddings (`openai/text-embedding-3-small`) | **Real** | knowledge-base retrieval |
+| Knowledge base (20 documents) | **Simulated** | fictional company data from the bootcamp kit |
+| Helpdesk API, ticket database, status page, employee directory | **Simulated** | REST API + MCP server with fault injection, provided by the kit and left unchanged |
+| Login | **Simulated** | identification by a directory-verified work email, no password |
+
+## Run it
+
+```powershell
+copy .env.example .env          # add your OPENROUTER_API_KEY
+docker compose up --build       # simulated helpdesk API + this app
+# open http://localhost:8000
+```
+
+Local, non-Docker steps are in the Quickstart below. Run the tests with `python -m pytest -q tests` and the scorecard with `python evals/run_isolated_evals.py`.
+
+## How it behaves: the approval gate
+
+A request such as "Please open a ticket: …" returns a draft (subject, category, priority, requester, attempted steps, KB references) and a `pending_action`. Nothing is created until the employee approves it in the UI (`/api/approve`). Rejecting creates nothing, approving twice creates one ticket, and phrases inside quoted text or "ignore previous instructions" never count as approval.
+
+## Evaluation
+
+Latest run of `evals/run_isolated_evals.py`: **10/10** (see `evals/isolated_scorecard.md`).
+
+| Category | Passed |
+|---|---|
+| grounding, clarification, unknown, guardrail, conflict, rejection, tool_failure, happy_path | 1/1 each |
+| policy_conflict | 2/2 |
+
+**The failure we fixed:** a Finance employee typing "I can't connect to the VPN" and then only "NX-112" got a bare abstention, because the follow-up had no VPN keyword. We added `_department_vpn_rule_reply` in `agent.py`, which reads the topic from earlier turns and gives the manifest's Finance rule. Before → after: abstention → "go straight to Security Operations, P2" with a citation (regression tests in `tests/test_department_vpn_followup.py`).
+
+## Guardrails and safety
+
+- Prompt injection and requests for secrets or other people's data are refused before the model runs.
+- Ticket status and listings are shown only to the signed-in, directory-verified owner; other tickets look the same as missing ones.
+- Retrieved text that contains instructions is quarantined, never followed.
+- If the status or ticket tool is down, the agent says so instead of inventing a result.
+- `.env` and the SQLite files are gitignored; the intelligence API is disabled unless a token is set.
+
+## Cost and latency
+
+From the last scorecard: average turn latency about 3 s, p95 about 7 s (live model calls). Cost is not reported by the app.
+
+## What I'd fix next
+
+- Real authentication (password/SSO) instead of identification by directory email.
+- The thinking status in the UI is generic stage text, not real streaming.
+- Strict verification abstains on some phrasings (for example "queue" for print jobs).
+- Bare error-code questions such as NX-503 for non-Finance departments can abstain instead of pointing to the live incident.
+- `add_ticket_note` is not wired into the chat flow.
+- The Docker setup has not been tested end to end on a machine with Docker.
+
+## Team
+
+| | Built |
+|---|---|
+| **Janat Halaseh** | agent (LangGraph, RAG, memory, MCP tools, verifier), Figma UI integration, tests and evals |
+| **Batoul Mharam** | `app.py` API, ticket intake and approval flow |
+
+## Acknowledgements
+
+Built during the **Agentic AI Bootcamp**, organized by Jerusalem High-Tech Foundry (JHF) in partnership with COMCEC. Simulated systems and dataset provided by the bootcamp kit.
+
+---
+
+# Kit reference
+
+*Simulated systems for the IT Helpdesk Agent brief of the Agentic AI Bootcamp, organized by Jerusalem High-Tech Foundry (JHF) · in partnership with COMCEC.*
 
 Everything your agent needs around it, so your week goes into the agent:
 
@@ -11,7 +121,7 @@ Everything your agent needs around it, so your week goes into the agent:
 - a **UI starter**, the **eval runner** and 10 **sample cases**.
 
 You build the agent: retrieval over the knowledge base, the conversation, the approval gate,
-your API contract on port 8000. Do not change the simulated systems: the hidden tests run
+your API contract. Do not change the simulated systems: the hidden tests run
 against the original.
 
 ## Quickstart (Windows PowerShell)
@@ -22,7 +132,7 @@ py -3.12 -m venv .venv
 pip install -r requirements-dev.txt
 copy .env.example .env                                  # then fill in OPENROUTER_API_KEY
 
-uvicorn services.helpdesk_api:app --port 8102           # terminal 1: the helpdesk API
+uvicorn services.helpdesk_api:app --host 127.0.0.1 --port 8102  # terminal 1: the helpdesk API
 python check_kit.py                                     # terminal 2: must end with "Kit ready."
 python dataset/validate_dataset.py                      # optional: dataset consistency
 ```
@@ -30,8 +140,9 @@ python dataset/validate_dataset.py                      # optional: dataset cons
 macOS/Linux: `python3.12 -m venv .venv`, `source .venv/bin/activate`, `cp .env.example .env`.
 Docker instead of uvicorn: `docker compose up --build` (same API on port 8102).
 
-One venv is enough for the kit **and** your agent: `requirements.txt` also pins the course's agent
-framework (`langgraph==1.2.10`, `openai==2.52.0`) and `mcp==1.28.1`, the MCP version CrewAI 1.15 needs.
+One venv is enough for the kit **and** your agent: `requirements.txt` pins LangGraph
+(`langgraph==1.2.10`) for guarded workflow routing, plus the OpenAI SDK (`openai==2.52.0`)
+and `mcp==1.28.1` for the MCP integration.
 `requirements-dev.txt` adds pytest. For a runtime-only install, use `pip install -r requirements.txt`.
 
 ## Layout
@@ -174,10 +285,28 @@ The export uses a versioned metadata format and contains references and payload 
 the ticket body. SQLite remains the local source for this metadata; the JSON file is a
 regenerable export. The generated database and its SQLite sidecar files are ignored by Git.
 
-Run the app after starting the helpdesk API and configuring `.env`:
+Run the agent API after starting the helpdesk API and configuring `.env`:
 
 ```powershell
-uvicorn app:app --port 8000
+python -m uvicorn app:app --host 127.0.0.1 --port 8200
+```
+
+The React demo in `NakhlaITHelpdesk` runs on port 8000 and proxies `/api/*` and
+`/health` to the agent API on port 8200. The browser never receives the simulated
+helpdesk `X-API-Key`; the agent's MCP process reads it from the kit's `.env`.
+Use two terminals from the kit directory:
+
+```powershell
+# Terminal 1: only if the agent API is not already running
+python -m uvicorn app:app --host 127.0.0.1 --port 8200
+
+# Terminal 2
+Set-Location .\NakhlaITHelpdesk
+npm run dev -- --host 127.0.0.1 --port 8000
+```
+
+Open `http://localhost:8000/#guide`. The simulated helpdesk API remains on port
+8102; do not start a second copy if it is already listening.
 ```
 
 Run the test suite with:
@@ -251,8 +380,8 @@ Local-only usage (put the token in your own, gitignored `.env`; never commit it)
 
 ```powershell
 $env:HELPDESK_INTELLIGENCE_TOKEN = "choose-a-long-random-value"
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
-curl.exe -X POST http://127.0.0.1:8000/api/intelligence/trends -H "Authorization: Bearer $env:HELPDESK_INTELLIGENCE_TOKEN" -H "Content-Type: application/json" -d "{}"
+python -m uvicorn app:app --host 127.0.0.1 --port 8200
+curl.exe -X POST http://127.0.0.1:8200/api/intelligence/trends -H "Authorization: Bearer $env:HELPDESK_INTELLIGENCE_TOKEN" -H "Content-Type: application/json" -d "{}"
 ```
 
 Guarantees: read-only (tickets, archive, Knowledge Base and approval state are never written); results keep
@@ -352,7 +481,7 @@ authorization are unchanged and still run.
 | `HELPDESK_INTELLIGENCE_TOKEN` | unset (routes disabled) | app: bearer token enabling the read-only `/api/intelligence/*` routes |
 | `HELPDESK_DATA_DIR`, `HELPDESK_DATASET_DIR` | `services/data`, `dataset` | API seed files |
 | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `MODEL`, `EMBEDDING_MODEL` | see `.env.example` | your agent |
-| `APP_URL` | `http://localhost:8000` | UI starter, eval runner |
+| `APP_URL` | `http://localhost:8200` | Gradio UI starter, eval runner |
 
 The API and the MCP server also read the kit's `.env` (without overriding variables you already set).
 

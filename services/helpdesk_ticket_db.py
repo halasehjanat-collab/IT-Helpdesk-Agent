@@ -11,10 +11,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 FIRST_CREATED_TICKET_NUMBER = 2001
 DEFAULT_DB_NAME = "helpdesk_tickets.sqlite3"
@@ -104,7 +105,7 @@ _SCHEMA = (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TicketDatabase:

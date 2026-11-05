@@ -82,7 +82,12 @@ def main() -> None:
     if sys.version_info < (3, 10):
         fail(f"Python {sys.version.split()[0]}", "Use Python 3.10 or newer (the kit is tested on 3.12).")
     try:
-        import fastapi, httpx, jsonschema, mcp, pymupdf, yaml  # noqa: F401,E401
+        import fastapi  # noqa: F401
+        import httpx
+        import jsonschema
+        import mcp
+        import pymupdf
+        import yaml
     except ImportError as exc:
         fail(f"Missing package: {exc.name}", "Activate your venv and run: pip install -r requirements.txt")
     ok(f"Python {sys.version.split()[0]} and the kit packages are installed")

@@ -1,5 +1,8 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 import agent as agent_module
 import app as app_module
@@ -56,7 +59,8 @@ def test_software_center_step_does_not_make_a_hardware_issue_software():
 
 def test_priority_p2_for_cannot_work_and_finance_vpn():
     prio = app_module._ticket_priority
-    assert prio("I cannot work, no workaround", "Engineering", None) == "P2"
+    assert prio("I cannot work, no workaround", "Engineering", None) is None
+    assert prio("I cannot work, no workaround", "Engineering", 1) == "P2"
     assert prio("VPN fails", "Finance", None) == "P2"
     assert prio("I cannot work, no workaround", "Engineering", 10) == "P1"
 
@@ -79,3 +83,16 @@ def test_isolated_eval_env_never_points_at_project_databases(tmp_path):
         assert tmp_path.resolve() in path.parents
         assert project_data not in path.parents
     assert env["HELPDESK_API_URL"].endswith(str(iso.HELPDESK_PORT))
+
+
+def test_isolated_eval_env_uses_the_selected_helpdesk_port(tmp_path):
+    env = iso.isolated_env(tmp_path, helpdesk_port=19321)
+
+    assert env["HELPDESK_API_URL"] == "http://127.0.0.1:19321"
+
+
+def test_isolated_eval_wait_rejects_an_exited_server_before_checking_health():
+    process = SimpleNamespace(poll=lambda: 1, returncode=1)
+
+    with pytest.raises(RuntimeError, match="server process exited"):
+        iso._wait("http://127.0.0.1:1/health", process)

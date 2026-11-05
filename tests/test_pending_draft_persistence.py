@@ -1,8 +1,6 @@
 """A pending draft must stay visible and actionable after later chat turns (offline)."""
 from unittest.mock import AsyncMock
 
-import pytest
-
 import app as app_module
 from tests.test_ui import ui  # noqa: F401  (fixture)
 

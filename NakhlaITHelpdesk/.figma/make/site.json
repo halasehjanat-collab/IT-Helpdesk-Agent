@@ -1,0 +1,10 @@
+{
+  "description": "A multilingual IT helpdesk interface for employees, support teams, and admins to explore AI-assisted support, track tickets, and manage service operations.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

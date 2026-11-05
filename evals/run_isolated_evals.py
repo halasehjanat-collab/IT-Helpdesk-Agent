@@ -19,11 +19,13 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -38,7 +40,10 @@ CASES = ROOT / "evals" / "cases.sample.jsonl"
 OUT_MD = ROOT / "evals" / "isolated_scorecard.md"
 
 
-def isolated_env(tmp: Path) -> dict[str, str]:
+def isolated_env(
+    tmp: Path,
+    helpdesk_port: int = HELPDESK_PORT,
+) -> dict[str, str]:
     """Environment that points every writable store at `tmp`."""
     env = dict(os.environ)
     env.update(
@@ -47,11 +52,18 @@ def isolated_env(tmp: Path) -> dict[str, str]:
             "HELPDESK_METADATA_DB_PATH": str(tmp / "metadata.sqlite3"),
             "CHAT_MEMORY_DB_PATH": str(tmp / "chat_memory.sqlite3"),
             "HELPDESK_ALLOW_DESTRUCTIVE_RESET": "1",
-            "HELPDESK_API_URL": f"http://127.0.0.1:{HELPDESK_PORT}",
+            "HELPDESK_API_URL": f"http://127.0.0.1:{helpdesk_port}",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
     return env
+
+
+def _available_port() -> int:
+    """Choose an unused loopback port for one isolated evaluator service."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def clear_local_references(tmp: Path) -> None:
@@ -74,13 +86,22 @@ def case_ids(only: str | None) -> list[str]:
     return ids
 
 
-def _wait(url: str, timeout: float = 60.0) -> None:
+def _wait(
+    url: str,
+    process: subprocess.Popen | None = None,
+    timeout: float = 60.0,
+) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"server process exited before becoming ready: {url} "
+                f"(exit code {process.returncode})"
+            )
         try:
-            urllib.request.urlopen(url, timeout=2)
-            return
-        except Exception:
+            with urllib.request.urlopen(url, timeout=2):
+                return
+        except (urllib.error.URLError, TimeoutError, OSError):
             time.sleep(0.5)
     raise RuntimeError(f"server did not become ready: {url}")
 
@@ -111,7 +132,11 @@ def main(argv: list[str]) -> int:
     options, passthrough = parser.parse_known_args(argv)
 
     tmp = Path(tempfile.mkdtemp(prefix="helpdesk-eval-"))
-    env = isolated_env(tmp)
+    helpdesk_port = _available_port()
+    app_port = _available_port()
+    while app_port == helpdesk_port:
+        app_port = _available_port()
+    env = isolated_env(tmp, helpdesk_port)
     if options.pipeline_diagnostics:
         env["HELPDESK_PIPELINE_DIAGNOSTICS"] = "1"
     procs: list[subprocess.Popen] = []
@@ -119,8 +144,8 @@ def main(argv: list[str]) -> int:
     started = time.time()
     try:
         for module, port in (
-            ("services.helpdesk_api:app", HELPDESK_PORT),
-            ("app:app", APP_PORT),
+            ("services.helpdesk_api:app", helpdesk_port),
+            ("app:app", app_port),
         ):
             procs.append(
                 subprocess.Popen(
@@ -131,8 +156,8 @@ def main(argv: list[str]) -> int:
                     env=env,
                 )
             )
-        _wait(f"http://127.0.0.1:{HELPDESK_PORT}/health")
-        _wait(f"http://127.0.0.1:{APP_PORT}/health")
+        _wait(f"http://127.0.0.1:{helpdesk_port}/health", procs[0])
+        _wait(f"http://127.0.0.1:{app_port}/health", procs[1])
 
         for case_id in case_ids(options.only):
             clear_local_references(tmp)
@@ -140,14 +165,15 @@ def main(argv: list[str]) -> int:
             subprocess.run(
                 [
                     sys.executable, str(ROOT / "evals" / "run_evals.py"),
-                    "--app", f"http://127.0.0.1:{APP_PORT}",
-                    "--helpdesk", f"http://127.0.0.1:{HELPDESK_PORT}",
+                    "--app", f"http://127.0.0.1:{app_port}",
+                    "--helpdesk", f"http://127.0.0.1:{helpdesk_port}",
                     "--only", case_id,
                     "--out", str(case_out),
                     *passthrough,
                 ],
                 cwd=ROOT,
                 env=env,
+                check=False,
             )
             case_json = case_out.with_suffix(".json")
             if case_json.exists():

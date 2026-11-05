@@ -1,0 +1,14 @@
+.env
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.zip
+*.backup
+.pytest_cache/
+.behavior-test-tmp*/
+.live-audit/
+NakhlaITHelpdesk/node_modules/
+NakhlaITHelpdesk/dist/
+services/data/*.sqlite3*
+chroma_db/

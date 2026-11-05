@@ -8,7 +8,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +101,7 @@ class SQLiteTicketMetadataStore:
         payload_sha256: str,
     ) -> dict[str, str]:
         """Record a successful external creation once per action key."""
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
 
         try:
             with closing(self._connect()) as connection, connection:

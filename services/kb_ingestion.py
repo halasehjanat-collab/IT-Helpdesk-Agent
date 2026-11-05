@@ -10,7 +10,6 @@ from typing import Any
 import fitz
 import yaml
 
-
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 150
 
@@ -304,10 +303,18 @@ def chunk_documents(
 
         chunk_index = 0
 
-        for start in range(0, len(text), step):
-            chunk_text = text[
-                start:start + chunk_size
-            ].strip()
+        faq_entries = _split_faq_entries(text)
+        if faq_entries:
+            windows = faq_entries
+        else:
+            windows = []
+            for start in range(0, len(text), step):
+                windows.append(text[start:start + chunk_size])
+                if start + chunk_size >= len(text):
+                    break
+
+        for chunk_text in windows:
+            chunk_text = chunk_text.strip()
 
             if not chunk_text:
                 continue
@@ -329,10 +336,33 @@ def chunk_documents(
 
             chunk_index += 1
 
-            if start + chunk_size >= len(text):
-                break
-
     return chunks
+
+
+_FAQ_QUESTION = re.compile(r"^\*\*[^*\n]+\?\*\*\s*$", re.MULTILINE)
+
+
+def _split_faq_entries(text: str) -> list[str]:
+    """Split a question-and-answer document into one chunk per entry.
+
+    Isolating each entry keeps a single disputed answer from discarding the
+    unrelated answers around it. Returns [] for ordinary documents.
+    """
+    starts = [match.start() for match in _FAQ_QUESTION.finditer(text)]
+
+    if len(starts) < 3:
+        return []
+
+    heading = text[:starts[0]].strip()
+    entries = [
+        text[begin:end].strip()
+        for begin, end in zip(starts, [*starts[1:], len(text)])
+    ]
+
+    if heading:
+        entries[0] = f"{heading}\n\n{entries[0]}"
+
+    return entries
 
 
 def _self_check() -> None:

@@ -21,7 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -126,12 +127,17 @@ _APPROVAL_BYPASS = _flags(
     r"\b(?:approv|confirm|review)|\bauto[\s-]?approve\b|"
     r"\b(?:skip|bypass)\b.{0,20}\bapproval\b"
 )
+_APPROVAL_BYPASS_NEGATION = _flags(
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|can’t)\s+$"
+)
 _OTHER_USER_DATA = _flags(
     r"\b(?:show|list|give|get|read|dump|export|view|access|look\s*up|pull|"
     r"see)\b.{0,40}\b(?:all|every|other|another|everyone'?s?|someone(?:\s+else)?'?s?|"
     r"their|his|her)\b.{0,30}\b(?:tickets?|employees?|staff|users?|records?|"
     r"directory|salar\w*|passwords?|profiles?|personal)|"
-    r"\btickets?\s+(?:of|for|from|belonging\s+to)\s+[\w.+-]+@[\w-]+\.[\w.]+|"
+    r"\b(?:show|list|give|get|read|dump|export|view|access|look\s*up|pull|"
+    r"see)\b.{0,50}\btickets?\s+(?:of|for|from|belonging\s+to)\s+"
+    r"[\w.+-]+@[\w-]+\.[\w.]+|"
     r"[\w.+-]+@[\w-]+\.[\w.]+'s\s+tickets?|"
     r"\b(?:other|another|previous|different)\s+(?:users?|sessions?|employees?|"
     r"people|conversations?)\b.{0,40}\b(?:said|asked|messages?|conversation|"
@@ -167,8 +173,14 @@ class PrivilegeClaim(Validator):
 
     def _validate(self, value: Any, metadata: dict[str, Any]):
         text = str(value)
+        approval_bypass = any(
+            not _APPROVAL_BYPASS_NEGATION.search(
+                text[max(0, match.start() - 32) : match.start()]
+            )
+            for match in _APPROVAL_BYPASS.finditer(text)
+        )
 
-        if _PRIVILEGE_CLAIM.search(text) or _APPROVAL_BYPASS.search(text):
+        if _PRIVILEGE_CLAIM.search(text) or approval_bypass:
             return FailResult(error_message="authorization_bypass")
 
         return PassResult()
@@ -195,7 +207,7 @@ _SECRET_PATTERNS = tuple(
         r"\b(?:api[_-]?key|secret|access[_-]?token|password)\s*[:=]\s*\S{6,}",
     )
 )
-_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
+_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _PHONE = re.compile(r"(?<![\w.])(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]){2,}\d{2,4}(?![\w.])")
 _TICKET_ID = re.compile(r"\bIT-\d{3,5}\b")

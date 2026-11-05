@@ -18,9 +18,10 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from services.helpdesk_ticket_db import TicketDatabase, TicketDatabaseError
 from services.kb_retriever import _document_is_eligible
@@ -44,8 +45,7 @@ _ERROR_CODE_PATTERN = re.compile(r"\b([A-Za-z]{2,5}-\d{2,5})\b")
 _NON_ERROR_CODE_PREFIXES = ("KB-", "SP-", "IT-")
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
-    "a an and are as at be but by for from has have i in is it its my not of on or so that the "
-    "this to was we when with after again still cannot cant can will would".split()
+    ["a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "i", "in", "is", "it", "its", "my", "not", "of", "on", "or", "so", "that", "the", "this", "to", "was", "we", "when", "with", "after", "again", "still", "cannot", "cant", "can", "will", "would"]
 )
 
 
@@ -61,7 +61,7 @@ def _parse_timestamp(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def extract_error_codes(*texts: Any) -> set[str]:
@@ -160,7 +160,7 @@ class KnowledgeCatalog:
         self.error_code_index = error_code_index
 
     @classmethod
-    def from_manifest(cls, manifest: dict[str, Any]) -> "KnowledgeCatalog":
+    def from_manifest(cls, manifest: dict[str, Any]) -> KnowledgeCatalog:
         try:
             entries = manifest["documents"]
             index = manifest.get("error_code_index", {})
@@ -193,7 +193,7 @@ class KnowledgeCatalog:
         return cls(documents, {str(k).upper(): list(v) for k, v in index.items()})
 
     @classmethod
-    def load(cls, path: Path | str | None = None) -> "KnowledgeCatalog":
+    def load(cls, path: Path | str | None = None) -> KnowledgeCatalog:
         manifest_path = Path(path) if path else DEFAULT_MANIFEST_PATH
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

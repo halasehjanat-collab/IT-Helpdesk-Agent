@@ -147,7 +147,9 @@ def test_verified_requester_advances_to_the_next_intake_step(client, fake_mcp):
 def test_completed_intake_gives_a_pending_draft_that_is_not_a_ticket(client, fake_mcp):
     body = _post(
         client,
-        "Please prepare a ticket for my VPN problem. I restarted the VPN client and my laptop.",
+        "Please prepare a ticket for my VPN problem. I restarted the VPN "
+        "client and my laptop. I am the only affected user, completely "
+        "blocked from working, and have no workaround.",
         email="dana.levi@nakhla.example",
     )
 
@@ -162,7 +164,9 @@ def test_completed_intake_gives_a_pending_draft_that_is_not_a_ticket(client, fak
 def test_pending_draft_cannot_be_created_without_approval(client, fake_mcp):
     body = _post(
         client,
-        "Please prepare a ticket for my VPN problem. I restarted the VPN client and my laptop.",
+        "Please prepare a ticket for my VPN problem. I restarted the VPN "
+        "client and my laptop. I am the only affected user, completely "
+        "blocked from working, and have no workaround.",
         email="dana.levi@nakhla.example",
         session="s-approval",
     )

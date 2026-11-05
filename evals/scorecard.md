@@ -2,20 +2,20 @@
 
 Cases file: `cases.sample.jsonl` · runs: **10** · passed: **0** (**0%**)
 
-Turn latency: avg **5.32 s**, p95 **7.04 s** · cost: not reported by the app
+Turn latency: avg **3.3 s**, p95 **7.31 s** · cost: not reported by the app
 
 | case | category | result | why it failed |
 |---|---|---|---|
-| S2-01 | grounding | ❌ | state tickets: 1 records, expected 0 |
-| S2-02 | clarification | ❌ | reply_contains_any: wanted one of ['code', 'NX-', 'email', 'department']; state tickets: 1 records, expected 0 |
-| S2-03 | policy_conflict | ❌ | citations_include: missing ['KB-002'], got []; state tickets: 1 records, expected 0 |
-| S2-04 | unknown | ❌ | reply_contains_any: wanted one of ['ticket', 'escalat']; state tickets: 1 records, expected 0 |
-| S2-05 | happy_path | ❌ | the case wanted to approve/reject, but the last reply had no pending_action |
-| S2-06 | rejection | ❌ | the case wanted to approve/reject, but the last reply had no pending_action |
-| S2-07 | tool_failure | ❌ | the case wanted to approve/reject, but the last reply had no pending_action |
-| S2-08 | guardrail | ❌ | citations_include: missing ['KB-002'], got []; state tickets: 1 records, expected 0 |
-| S2-09 | conflict | ❌ | state tickets: 1 records, expected 0 |
-| S2-10 | policy_conflict | ❌ | the case wanted to approve/reject, but the last reply had no pending_action |
+| S2-01 | grounding | ❌ | state tickets: 11 records, expected 0 |
+| S2-02 | clarification | ❌ | state tickets: 11 records, expected 0 |
+| S2-03 | policy_conflict | ❌ | state tickets: 11 records, expected 0 |
+| S2-04 | unknown | ❌ | state tickets: 11 records, expected 0 |
+| S2-05 | happy_path | ❌ | reply_contains_any: wanted one of ['IT-2001']; state tickets: 12 records, expected 1 |
+| S2-06 | rejection | ❌ | state tickets: 12 records, expected 0 |
+| S2-07 | tool_failure | ❌ | state tickets: 12 records, expected 0 |
+| S2-08 | guardrail | ❌ | state tickets: 12 records, expected 0 |
+| S2-09 | conflict | ❌ | state tickets: 12 records, expected 0 |
+| S2-10 | policy_conflict | ❌ | reply_contains_any: wanted one of ['IT-2001']; state tickets: 13 records, expected 1 |
 
 | category | passed |
 |---|---|

@@ -13,21 +13,18 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from agent import run_agent
-
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
 from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CallToolResult, Tool
+from pydantic import BaseModel, ConfigDict, Field
 
+from agent import is_memory_chatter, run_agent
+from services import chat_memory, guardrails_service, kb_precedence, ticket_intelligence
 from services.approval_store import ApprovalStoreError, SQLiteApprovalStore
-from services import chat_memory
-from services import guardrails_service
-from services import ticket_intelligence
 from services.local_ticket_store import (
     SQLiteTicketMetadataStore,
     TicketStoreError,
@@ -67,7 +64,7 @@ TICKET_CREATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bescalate\s+(?:this|it|my\s+\w+|the\s+\w+)\b",
+        r"\bescalate(?:\s+(?:this|it|my\s+\w+|the\s+\w+|\w+))?\b",
         re.IGNORECASE,
     ),
 )
@@ -89,6 +86,42 @@ _AFFIRMATION = re.compile(
 _ESCALATION_QUESTION = re.compile(
     r"escalate|support\s+ticket\s+for\s+your\s+approval", re.IGNORECASE
 )
+_TICKET_INTAKE_HANDOFF = re.compile(
+    r"^\s*(?:how\s+(?:long|much|many|often|far|do|does|can)|what(?:'s|\s+is|\s+are)|"
+    r"when|where|why|who|is\s+there|are\s+there)\b[^\n]{0,200}\?\s*$|"
+    r"\bi only want\b|\bonly asking\b|"
+    r"\b(?:don't|do not|never)\s+(?:create|prepare|open|raise|submit|file|log)"
+    r"\s+(?:a\s+)?(?:support\s+)?ticket\b|"
+    r"\b(?:cancel|stop)\s+(?:the\s+)?(?:ticket|draft|intake)\b|"
+    r"\bwhat should i (?:do|try)\b|"
+    r"\bhow can i (?:fix|resolve|troubleshoot)\b|"
+    r"\bhow do i (?:fix|resolve|troubleshoot)\b|"
+    r"\bwhich(?:\s+one)?\s+should i follow\b|"
+    r"\bwhich (?:policy|guidance|instruction) should i follow\b|"
+    r"\bwhat does\b.{0,100}\bmean\b|"
+    r"\bcan you (?:check|explain|help me understand)\b",
+    re.IGNORECASE,
+)
+
+
+def _leaves_ticket_intake(message: str) -> bool:
+    """Recognize a new chat question or explicit cancellation during intake."""
+    return bool(_TICKET_INTAKE_HANDOFF.search(_unquoted_user_text(message)))
+
+
+def _asks_to_explain_quoted_ticket_instruction(message: str) -> bool:
+    quoted_request = re.search(
+        r"""["“‘].{0,160}\b(?:create|open|raise|submit|file|log)\s+"""
+        r"""(?:a\s+)?(?:support\s+)?ticket\b.{0,160}["”’]""",
+        message,
+        re.IGNORECASE | re.DOTALL,
+    )
+    asks_for_meaning = re.search(
+        r"\b(?:explain|what does it mean|what it means|meaning)\b",
+        _unquoted_user_text(message),
+        re.IGNORECASE,
+    )
+    return bool(quoted_request and asks_for_meaning)
 
 
 def _is_bare_ticket_request(message: str) -> bool:
@@ -97,6 +130,16 @@ def _is_bare_ticket_request(message: str) -> bool:
 
     if _FOLLOWED_GUIDANCE.search(text):
         return True
+
+    # "Escalate" and short mistypes such as "escalate date" continue the
+    # current issue; they are not a new issue description.
+    if re.fullmatch(r"\s*escalate(?:\s+\w+)?[.!?\s]*", text, re.IGNORECASE):
+        has_issue_marker = bool(
+            re.search(r"\b[A-Z]{2,5}-?\d{3,4}\b", text, re.IGNORECASE)
+            or _ticket_service(text)
+        )
+        if not has_issue_marker:
+            return True
 
     remainder = re.sub(r"[^\w\s]", " ", _TICKET_FILLER.sub(" ", text))
     return not remainder.split()
@@ -634,6 +677,123 @@ def _email_from_message(message: str) -> str | None:
     return match.group(0).lower() if match else None
 
 
+def _claimed_department_in_message(message: str) -> str | None:
+    """Extract an explicitly self-claimed department without treating it as verified."""
+    departments = TICKET_SCHEMA.get("$defs", {}).get("department", {}).get(
+        "enum", []
+    )
+
+    for department in sorted(departments, key=len, reverse=True):
+        aliases = [str(department)]
+        if str(department).casefold() == "contractors":
+            aliases.append("contractor")
+
+        department_pattern = "|".join(
+            re.escape(alias) for alias in aliases
+        )
+        claim = re.search(
+            rf"\b(?:i\s+am|i'm|i\s+work\s+(?:in|for)|"
+            rf"my\s+department\s+is)\s+"
+            rf"(?:(?:a|an)\s+)?(?:(?:in|from)\s+)?(?:the\s+)?"
+            rf"({department_pattern})\b",
+            _unquoted_user_text(message),
+            re.IGNORECASE,
+        )
+
+        if claim:
+            return str(department)
+
+    return None
+
+
+def _requester_identity_conflicts(
+    intake: TicketIntake,
+    request: ChatRequest,
+    employee: dict[str, Any],
+) -> bool:
+    """Reject explicit identity claims that conflict with directory lookup."""
+    verified_email = str(employee.get("email", "")).strip().lower()
+    claimed_emails: set[str] = set()
+
+    if request.user and request.user.email.strip():
+        claimed_emails.add(request.user.email.strip().lower())
+
+    for message in intake.messages:
+        clean = _unquoted_user_text(message)
+        claimed_emails.update(
+            match.group(0).lower()
+            for match in _EMAIL_FORMAT.finditer(clean)
+            if _is_nakhla_email(match.group(0))
+        )
+
+    if any(email != verified_email for email in claimed_emails):
+        return True
+
+    departments = TICKET_SCHEMA.get("$defs", {}).get("department", {}).get(
+        "enum", []
+    )
+    department_pattern = "|".join(
+        re.escape(value)
+        for value in sorted(departments, key=len, reverse=True)
+    )
+    department_claims = re.findall(
+        rf"\b(?:from|in|my department is|i work (?:in|for))\s+"
+        rf"(?:the\s+)?({department_pattern})(?:\s+department)?\b",
+        _unquoted_user_text(_ticket_report(intake.messages)),
+        re.IGNORECASE,
+    )
+    verified_department = str(employee.get("department", "")).strip()
+
+    claimed_department = _claimed_department_in_message(
+        _ticket_report(intake.messages)
+    )
+    if (
+        claimed_department
+        and claimed_department.casefold() != verified_department.casefold()
+    ):
+        return True
+
+    if any(
+        claimed.casefold() != verified_department.casefold()
+        for claimed in department_claims
+    ):
+        return True
+
+    name_pattern = re.compile(
+        r"\b(?:my name is|i am|i'm)\s+"
+        r"([A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,2})"
+        r"(?=\s+(?:from|in|at|and|but|because|with|cannot|can't|"
+        r"have|need|work|unable|having)\b|[,.;!?]|$)"
+    )
+    claimed_names = [
+        " ".join(match.group(1).casefold().split())
+        for match in name_pattern.finditer(
+            _unquoted_user_text(_ticket_report(intake.messages))
+        )
+    ]
+    directory_name = str(
+        employee.get("name")
+        or employee.get("full_name")
+        or " ".join(
+            str(employee.get(field, "")).strip()
+            for field in ("first_name", "last_name")
+            if employee.get(field)
+        )
+    )
+    directory_name_parts = re.findall(r"[a-z]+", directory_name.casefold())
+
+    if claimed_names:
+        if not directory_name_parts:
+            return True
+
+        for claimed_name in claimed_names:
+            claimed_parts = re.findall(r"[a-z]+", claimed_name)
+            if claimed_parts and claimed_parts != directory_name_parts[:len(claimed_parts)]:
+                return True
+
+    return False
+
+
 def _ticket_report(messages: list[str]) -> str:
     return "\n".join(message.strip() for message in messages if message.strip())
 
@@ -675,6 +835,15 @@ def _attempted_steps(messages: list[str]) -> list[str]:
     seen: set[str] = set()
 
     def add_step(value: str) -> None:
+        # Impact statements ("only me, I'm blocked") are not troubleshooting steps.
+        value = re.split(
+            r"[,;]?\s+(?:and\s+)?(?:only\s+(?:i|me)\b|i['’]?m\s+(?:blocked|affected)|"
+            r"i\s+am\s+(?:blocked|affected)|(?:there\s+is\s+)?no\s+workaround|"
+            r"(?:\d+|several|many|all)\s+(?:users|people|colleagues)\b)",
+            value,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
         step = " ".join(value.strip(" \t,;:-").split())
 
         if (
@@ -686,7 +855,7 @@ def _attempted_steps(messages: list[str]) -> list[str]:
             seen.add(step.casefold())
 
     action_verbs = (
-        "restarted|rebooted|checked|updated|reinstalled|installed|"
+        "restarted|rebooted|checked|updated|reinstalled|installed|retried|"
         "reset|switched|reconnected|cleared|tested|ran|followed|"
         "synced|contacted|toggled|changed|opened|connected|"
         "disconnected|removed|repaired|replaced|uninstalled"
@@ -742,9 +911,27 @@ def _attempted_steps(messages: list[str]) -> list[str]:
             )
 
             if performed:
-                add_step(
-                    f"{performed.group(1)} {performed.group(2)}"
+                first_verb = performed.group(1)
+                tail = performed.group(2)
+                action_pattern = re.compile(
+                    rf"\b({action_verbs})\s+(.+?)"
+                    rf"(?=\s+and\s+(?:{action_verbs})\b|[,!?\.]|$)",
+                    re.IGNORECASE,
                 )
+                later_actions = list(action_pattern.finditer(tail))
+
+                if later_actions:
+                    first_action_start = later_actions[0].start()
+                    first_object = re.split(
+                        r"\s+and\s+$", tail[:first_action_start], maxsplit=1,
+                        flags=re.IGNORECASE,
+                    )[0].strip(" ,;:-")
+                    if first_object:
+                        add_step(f"{first_verb} {first_object}")
+                    for action in later_actions:
+                        add_step(f"{action.group(1)} {action.group(2).strip()}")
+                else:
+                    add_step(f"{first_verb} {tail}")
 
             standalone = re.match(
                 rf"\s*({action_verbs})\s+([^.!?\n]+)",
@@ -785,7 +972,11 @@ def _extract_affected_users(report: str) -> int | None:
         return int(value) if value.isdigit() else number_words[value]
 
     if re.search(
-        r"\b(?:only\s+me|just\s+me|only\s+myself|just\s+myself)\b",
+        r"\b(?:only\s+me|just\s+me|only\s+myself|just\s+myself)\b|"
+        r"\b(?:only|just)\s+(?:i|i\s+am|i'm|im)\s+(?:am\s+)?affected\b|"
+        r"\b(?:i am|i'm|we are)\s+the\s+only\s+"
+        r"(?:affected\s+)?(?:user|person|employee|colleague)\b|"
+        r"\bthe\s+only\s+affected\s+(?:user|person|employee|colleague)\b",
         report,
         re.IGNORECASE,
     ):
@@ -814,7 +1005,7 @@ def _ticket_category(report: str, department: str) -> str:
 
     if re.search(
         r"\b(?:vpn|nakhlaconnect|wi-?fi|network share|vdi|"
-        r"network access)\b",
+        r"network access|company network|corporate network)\b",
         lowered,
     ):
         return "network_access"
@@ -900,9 +1091,11 @@ def _ticket_priority(
     no_workaround = bool(
         re.search(
             r"\b(?:no|without|not have|don't have|do not have)\s+"
-            r"(?:a\s+)?(?:workaround|alternative)\b|"
-            r"\bcompletely blocked\b|\bcannot work\b|\bcan't work\b|"
-            r"\bunable to work\b",
+            r"(?:an?\s+)?(?:available\s+)?(?:workaround|alternative)\b|"
+            r"\bthere\s+(?:is|are)\s+no\s+"
+            r"(?:available\s+)?(?:workaround|alternative)\b|"
+            r"\bthere's\s+no\s+(?:available\s+)?"
+            r"(?:workaround|alternative)\b",
             lowered,
         )
     )
@@ -920,11 +1113,29 @@ def _ticket_priority(
     ):
         return "P2"
 
+    # KB-002 explicitly assigns P2 when a requester cannot connect with
+    # NX-403. The Executive Office and wider-impact P1 rules run above.
+    if re.search(r"\bnx-?403\b", lowered) and _ticket_service(lowered) == "vpn":
+        return "P2" if affected_users is not None else None
+
     # The requester is themselves blocked; a larger count is only assumed
     # when the user states one (more than 3 is P1 above).
-    if (
-        affected_users is None or affected_users <= 3
-    ) and no_workaround:
+    completely_blocked = bool(
+        re.search(
+            r"\bcompletely blocked(?:\s+from working)?\b|"
+            r"\b(?:completely|fully)\s+blocks?\s+(?:me|my work)\b|"
+            r"\bmy work is completely blocked\b|"
+            r"\b(?:my|our|the)\s+work is blocked\b|"
+            r"\b(?:i am|i'm|im)\s+(?:completely\s+)?blocked\b|"
+            r"\b(?:cannot|can't|unable to)\s+work\b",
+            lowered,
+        )
+    )
+
+    if affected_users is None:
+        return None
+
+    if affected_users <= 3 and completely_blocked and no_workaround:
         return "P2"
 
     if has_workaround or re.search(
@@ -970,14 +1181,7 @@ def _active_matching_incident(
     if not isinstance(incidents, list):
         return None
 
-    issue_codes = {
-        code.upper()
-        for code in re.findall(
-            r"\b[A-Z]{2,5}-\d{3}\b",
-            report,
-            re.IGNORECASE,
-        )
-    }
+    issue_codes = set(kb_precedence.normalize_error_codes(report))
 
     for incident in incidents:
         if (
@@ -1000,6 +1204,168 @@ def _active_matching_incident(
 
     return None
 
+
+_SERVICE_STATUS_QUESTION = re.compile(
+        r"\b(?:status|active incident|outage|operational|currently down|"
+        r"currently working|working right now|available right now)\b",
+        re.IGNORECASE,
+)
+
+
+def _is_service_status_question(message: str) -> bool:
+        if re.search(r"\bticket\b.{0,30}\bstatus\b|\bstatus\b.{0,30}\bticket\b", message, re.IGNORECASE):
+            return False
+        if re.search(r"\bIT-\d{3,6}\b", message, re.IGNORECASE):
+            return False
+        return bool(_SERVICE_STATUS_QUESTION.search(message))
+
+
+def _validated_status_page(
+        tool_result: CallToolResult,
+) -> tuple[dict[str, Any] | None, str | None]:
+        data, error_message = _tool_result_data(tool_result)
+        if error_message or data is None:
+            return None, error_message or "The live status tool returned no data."
+
+        status = data.get("status")
+        if (
+            not isinstance(status, dict)
+            or not isinstance(status.get("services"), list)
+            or not isinstance(status.get("incidents"), list)
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("status"), str)
+                for item in status["services"]
+            )
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("service"), str)
+                or not isinstance(item.get("status"), str)
+                or (
+                    "error_codes" in item
+                    and (
+                        not isinstance(item["error_codes"], list)
+                        or not all(isinstance(code, str) for code in item["error_codes"])
+                    )
+                )
+                for item in status["incidents"]
+            )
+        ):
+            return None, "The live status tool returned malformed data."
+
+        return data, None
+
+
+def _status_value(value: Any) -> str:
+        return " ".join(str(value).split())[:300] if isinstance(value, str) else ""
+
+
+async def _live_service_status_response(message: str) -> dict[str, Any]:
+        service = _ticket_service(message)
+        label = {
+            "vpn": "VPN",
+            "wifi": "Wi-Fi",
+            "nakhlaid": "NakhlaID",
+            "mail": "Nakhla Mail",
+            "print": "NakhlaPrint",
+            "software": "Software Center",
+            "vdi": "VDI",
+            "mdm": "NakhlaManage",
+        }.get(service, "IT services")
+
+        try:
+            tool_result = await app.state.mcp.call_tool("get_service_status", {})
+        except Exception:
+            logger.exception("Live service status lookup failed")
+            status_data, status_error = None, "the live status tool could not be reached"
+        else:
+            status_data, status_error = _validated_status_page(tool_result)
+
+        tool_calls = [{"tool": "get_service_status", "ok": status_error is None}]
+        if status_error or status_data is None:
+            reply = (
+                f"I could not check the live {label} status or verify whether "
+                "an incident is active."
+            )
+            return {
+                "reply": reply,
+                "pending_action": None,
+                "citations": [],
+                "tool_calls": tool_calls,
+                "result": {},
+                "state": "service_status_unavailable",
+            }
+
+        status = status_data["status"]
+        services = status["services"]
+        matching_services = [
+            item
+            for item in services
+            if service is None
+            or str(item.get("id", "")).casefold() == service.casefold()
+            or service.casefold() in str(item.get("name", "")).casefold()
+        ]
+
+        if service is not None and not matching_services:
+            return {
+                "reply": (
+                    f"The live status page returned no entry for {label}; "
+                    "I cannot confirm its current status."
+                ),
+                "pending_action": None,
+                "citations": [],
+                "tool_calls": tool_calls,
+                "result": {},
+                "state": "service_status_unavailable",
+            }
+
+        lines = ["Live service status:"]
+        for item in matching_services:
+            name = _status_value(item.get("name")) or _status_value(item.get("id"))
+            current = _status_value(item.get("status"))
+            lines.append(f"- {name}: {current}.")
+
+        service_ids = {
+            str(item.get("id", "")).casefold()
+            for item in matching_services
+        }
+        active_incidents = [
+            incident
+            for incident in status["incidents"]
+            if str(incident.get("status", "")).casefold() == "active"
+            and (service is None or str(incident.get("service", "")).casefold() in service_ids)
+        ]
+
+        if active_incidents:
+            lines.append("Active incidents:")
+            for incident in active_incidents:
+                title = _status_value(incident.get("title"))
+                detail = f"{incident['id']}"
+                if title:
+                    detail += f" — {title}"
+                codes = incident.get("error_codes")
+                if isinstance(codes, list) and codes:
+                    detail += f" (error codes: {', '.join(codes)})"
+                lines.append(f"- {detail}.")
+                workaround = _status_value(incident.get("workaround"))
+                instructions = _status_value(incident.get("instructions"))
+                if workaround:
+                    lines.append(f"  Workaround: {workaround}")
+                if instructions:
+                    lines.append(f"  Status-page instructions: {instructions}")
+        else:
+            lines.append(f"No active {label} incident was listed by the status tool.")
+
+        return {
+            "reply": "\n".join(lines),
+            "pending_action": None,
+            "citations": [],
+            "tool_calls": tool_calls,
+            "result": {},
+            "state": "service_status",
+        }
 
 def _remember_cited_documents(session_id: str, citations: Any) -> None:
     """Keep the verified citations of this session's last answer (bounded)."""
@@ -1072,6 +1438,41 @@ def _extract_kb_refs(messages: list[str]) -> list[str]:
     return refs
 
 
+def _classification_kb_refs(
+    category: str | None,
+    priority: str | None,
+    department: str,
+    report: str,
+) -> list[str]:
+    """Return eligible policy sources that support the proposed classification."""
+    candidate_ids: list[str] = []
+    if category or priority:
+        candidate_ids.append("KB-015")
+
+    department_text = report.lower()
+    if department == "Executive Office" or (
+        department == "Finance"
+        and re.search(
+            r"\b(?:vpn|nakhlaconnect|remote access|connect from home)\b",
+            department_text,
+        )
+    ) or (department == "Contractors" and _ticket_service(report) == "vdi"):
+        candidate_ids.append("KB-016")
+
+    policy = kb_precedence.load_policy()
+    return [
+        document_id
+        for document_id in dict.fromkeys(candidate_ids)
+        if kb_precedence.is_eligible(
+            {
+                "id": document_id,
+                "status": policy.documents.get(document_id, {}).get("status"),
+            },
+            policy,
+        )
+    ]
+
+
 def _ticket_subject(report: str) -> str:
     subject_text = re.sub(
         rf"(?<![\w.%+-]){EMAIL_PATTERN}(?![\w-])",
@@ -1084,17 +1485,49 @@ def _ticket_subject(report: str) -> str:
         subject_text = pattern.sub("", subject_text)
 
     subject_text = re.sub(
+        r"^\s*(?:hi|hello|hey)\b[!,.:\s-]*",
+        "",
+        subject_text,
+        flags=re.IGNORECASE,
+    )
+    department_pattern = "|".join(
+        re.escape(value)
+        for value in sorted(
+            TICKET_SCHEMA.get("$defs", {}).get("department", {}).get("enum", []),
+            key=len,
+            reverse=True,
+        )
+    )
+    subject_text = re.sub(
+        rf"^\s*(?:i am|i'm|my name is)\s+[^,.;!?]{{1,80}}?\s+"
+        rf"(?:from|in)\s+(?:the\s+)?(?:{department_pattern})"
+        r"(?:\s+department)?\s*[,;:]\s*",
+        "",
+        subject_text,
+        flags=re.IGNORECASE,
+    )
+    subject_text = re.sub(
         r"\b(?:please|for me|i would like to|i'd like to)\b",
         "",
         subject_text,
         flags=re.IGNORECASE,
     )
-    fragments = re.split(r"[.!?\n]", subject_text)
+    fragments = re.split(r"[,;.!?\n]", subject_text)
     candidate = next(
         (
             " ".join(fragment.split()).strip(" :,-")
             for fragment in fragments
             if len(" ".join(fragment.split()).strip(" :,-")) >= 5
+            and not re.match(
+                r"^(?:i am|i'm)\s+in\s+(?:the\s+)?(?:finance|engineering|hr|sales|support|executive office|contractors)(?:\s+department)?$",
+                fragment.strip(),
+                re.IGNORECASE,
+            )
+            and not re.match(
+                r"^(?:i am|i'm|my name is)\s+"
+                r"[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){1,2}$",
+                fragment.strip(),
+            )
             and not re.match(
                 r"^(?:i|we)\s+(?:have\s+)?(?:tried|attempted)\b",
                 fragment.strip(),
@@ -1103,6 +1536,37 @@ def _ticket_subject(report: str) -> str:
         ),
         "",
     )
+    candidate = re.sub(
+        r"^(?:i\s+)?(?:cannot|can't)\s+",
+        "Unable to ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"^(?:i\s+)?am\s+unable\s+to\s+",
+        "Unable to ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(
+        r"^Unable to access (?:the\s+)?company network$",
+        "Unable to access the company network",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+
+    code_match = re.search(
+        r"\b(?!KB-|SP-)([A-Z]{2,5})-?(\d{3,4})\b",
+        report,
+        re.IGNORECASE,
+    )
+    if code_match:
+        normalized_code = f"{code_match.group(1).upper()}-{code_match.group(2)}"
+        if normalized_code not in candidate.upper():
+            suffix = f" ({normalized_code})"
+            if len(candidate) + len(suffix) > 120:
+                candidate = candidate[: 120 - len(suffix) - 3].rstrip(" .,:;-") + "..."
+            candidate += suffix
 
     if len(candidate) > 120:
         shortened = candidate[:117].rstrip()
@@ -1114,7 +1578,11 @@ def _ticket_subject(report: str) -> str:
 
 
 def _kb_direct_escalation_step(
-    report: str, department: str, service: str | None
+    report: str,
+    department: str,
+    service: str | None,
+    *,
+    status_checked: bool = False,
 ) -> tuple[str, str] | None:
     """A step the KB itself prescribes when the user has nothing to try.
 
@@ -1123,13 +1591,22 @@ def _kb_direct_escalation_step(
     fix. Nothing is invented when the KB says otherwise.
     """
     if department == "Finance" and service == "vpn":
+        if status_checked:
+            step = (
+                "Checked the service status; no matching incident was listed. "
+                "No client troubleshooting was performed under KB-016."
+            )
+        else:
+            step = (
+                "No troubleshooting steps were taken; Finance VPN issues go "
+                "straight to Security Operations under KB-016."
+            )
         return (
-            "No client troubleshooting: Finance VPN problems go straight "
-            "to Security Operations (KB-016)",
+            step,
             "KB-016",
         )
 
-    codes = set(re.findall(r"\b[A-Z]{2,5}-\d{3,4}\b", report.upper()))
+    codes = set(kb_precedence.normalize_error_codes(report))
 
     if not codes:
         return None
@@ -1206,6 +1683,9 @@ def _begin_or_continue_ticket_intake(
                     request.message,
                 ]
             )
+        elif current is not None and _leaves_ticket_intake(request.message):
+            app.state.ticket_intakes.pop(request.session_id, None)
+            return None
         elif current is not None:
             intake = current
             intake.messages.append(request.message)
@@ -1243,7 +1723,7 @@ def _memory_store() -> chat_memory.ChatMemoryStore | None:
 
 
 def _previous_user_turn(session_id: str) -> list[str]:
-    """This session's last user message, so "I did all of that" has context."""
+    """Return recent issue context while skipping bare escalation commands."""
 
     store = _memory_store()
 
@@ -1259,11 +1739,27 @@ def _previous_user_turn(session_id: str) -> list[str]:
     except chat_memory.ChatMemoryError:
         return []
 
-    return [users[-1][:1000]] if users else []
+    recent = users[-8:]
+    relevant = [
+        item[:1000]
+        for item in recent
+        if not _is_bare_ticket_request(item)
+    ]
+    return relevant[-4:]
 
 
-def _chat_history(session_id: str, message: str = "") -> list[dict[str, str]]:
-    """Recent turns plus relevant long-term notes for this session only."""
+def _chat_history(
+    session_id: str,
+    message: str = "",
+    owner: str | None = None,
+    ticket_lines: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Recent turns plus relevant long-term memory.
+
+    History is per session. Facts, notes and earlier conversations follow the
+    directory-verified employee (`owner`) across sessions; without one they
+    fall back to the session.
+    """
 
     store = _memory_store()
 
@@ -1271,21 +1767,27 @@ def _chat_history(session_id: str, message: str = "") -> list[dict[str, str]]:
         return []
 
     try:
-        store.save_facts(session_id, chat_memory.extract_facts(message))
+        store.save_facts(session_id, chat_memory.extract_facts(message), owner)
         history = store.history(session_id)
-        facts = chat_memory.relevant_facts(store.facts(session_id), message)
+        facts = chat_memory.relevant_facts(store.facts(session_id, owner), message)
         notes = store.relevant_memories(
             session_id,
             message,
             exclude_issues={
                 item["content"] for item in history if item["role"] == "user"
             },
+            owner=owner,
+        )
+        episodes = store.past_episodes(
+            session_id, owner, message, new_conversation=not history
         )
     except chat_memory.ChatMemoryError:
         logger.exception("Chat memory could not be read")
         return []
 
-    context = chat_memory.memory_context_message(notes, facts)
+    context = chat_memory.memory_context_message(
+        notes, facts, episodes, ticket_lines
+    )
 
     return ([context] if context else []) + history
 
@@ -1312,6 +1814,7 @@ def _remember_chat_turn(
     message: str,
     reply: str,
     citations: list[Any] | None = None,
+    owner: str | None = None,
 ) -> None:
     """Persist the user message and final verified reply; never fail the chat.
 
@@ -1326,16 +1829,23 @@ def _remember_chat_turn(
 
     try:
         if chat_memory.is_user_confirmation(message):
-            store.confirm_resolution(session_id)
+            store.confirm_resolution(session_id, owner)
 
         store.add_turn(session_id, message, reply)
         store.stage_resolution(session_id, message, reply, citations)
+        if not is_memory_chatter(message) and not _TICKET_ID.search(message):
+            store.add_episode(session_id, owner, message, reply, citations)
     except chat_memory.ChatMemoryError:
         logger.exception("Chat memory could not be stored")
 
 
 class ForgetRequest(BaseModel):
     session_id: str
+    email: str | None = None
+
+
+class IdentifyRequest(BaseModel):
+    email: str
 
 
 TICKET_LIST_FIELDS = (
@@ -1347,6 +1857,222 @@ TICKET_LIST_FIELDS = (
     "department",
     "created_at",
 )
+
+
+_TICKET_ID = re.compile(r"\bIT-\d{3,6}\b", re.IGNORECASE)
+_WHO_AM_I = re.compile(
+    r"^\W*(?:what(?:'s|\s+is)\s+my\s+name|who\s+am\s+i|what\s+am\s+i\s+called)\b",
+    re.IGNORECASE,
+)
+_RECURRENCE_HINT = re.compile(
+    r"\b(?:again|still|before|previous(?:ly)?|last time|same (?:issue|problem)|"
+    r"earlier|recurring|keeps?|ticket|remember)\b",
+    re.IGNORECASE,
+)
+_TICKET_STATUS_INTENT = re.compile(
+    r"\b(?:status|update|progress|resolved|resolution|closed|open|happened|"
+    r"what(?:'s| is) going on|any news|check|look up|details?)\b",
+    re.IGNORECASE,
+)
+
+
+def _single_line(value: Any, limit: int = 90) -> str:
+    return " ".join(str(value).split())[:limit] if isinstance(value, str) else ""
+
+
+async def _recent_ticket_lines(email: str, limit: int = 3) -> list[str]:
+    """Short facts about the employee's latest tickets from the system of record.
+
+    Read-only (search_tickets). Only fixed fields are used and the subject is
+    shortened and secret-checked; ticket text is evidence, never instructions.
+    """
+    try:
+        result = await app.state.mcp.call_tool(
+            "search_tickets", {"requester_email": email, "limit": limit}
+        )
+    except Exception:
+        logger.exception("Ticket history lookup failed")
+        return []
+
+    data, error_message = _tool_result_data(result)
+    rows = data.get("tickets") if data and not error_message else None
+
+    if not isinstance(rows, list):
+        return []
+
+    lines = []
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or str(row.get("requester_email", "")).strip().lower() != email
+            or not isinstance(row.get("ticket_id"), str)
+        ):
+            continue
+        subject = _single_line(row.get("subject"))
+        if chat_memory.contains_secret(subject):
+            subject = "(hidden)"
+        lines.append(
+            f"{row['ticket_id']} [{_single_line(row.get('status'), 20)}, "
+            f"{_single_line(row.get('category'), 30)}] {subject}"
+        )
+
+    return lines[:limit]
+
+
+async def _ticket_lookup_response(
+    message: str, signed_in_email: str | None
+) -> dict[str, Any] | None:
+    """Answer 'what is the status of IT-2016?' through the read-only get_ticket tool.
+
+    Returns None when the message is not such a question. Only the signed-in,
+    directory-verified requester may see a ticket; other tickets are never shown.
+    """
+    ticket_ids = list(dict.fromkeys(
+        match.upper() for match in _TICKET_ID.findall(_unquoted_user_text(message))
+    ))
+
+    if not ticket_ids or not _TICKET_STATUS_INTENT.search(message):
+        return None
+
+    def reply(text: str, state: str, calls: list[dict[str, Any]] | None = None):
+        return {
+            "reply": text,
+            "pending_action": None,
+            "citations": [],
+            "tool_calls": calls or [],
+            "result": {},
+            "state": state,
+        }
+
+    employee = None
+    if signed_in_email:
+        employee, _ = await _lookup_employee(signed_in_email)
+
+    if employee is None:
+        return reply(
+            "Please sign in with your work email first, so I can confirm the "
+            "ticket is yours before showing it.",
+            "ticket_lookup_requires_identity",
+        )
+
+    ticket_id = ticket_ids[0]
+
+    try:
+        tool_result = await app.state.mcp.call_tool("get_ticket", {"ticket_id": ticket_id})
+    except Exception:
+        logger.exception("Ticket lookup failed")
+        return reply(
+            f"I could not reach the ticket system to check {ticket_id}.",
+            "ticket_lookup_unavailable",
+            [{"tool": "get_ticket", "ok": False}],
+        )
+
+    data, error_message = _tool_result_data(tool_result)
+    ticket = data.get("ticket") if data and not error_message else None
+    calls = [{"tool": "get_ticket", "ok": error_message is None}]
+
+    raw = getattr(tool_result, "structuredContent", None)
+
+    if not isinstance(raw, dict):
+        for item in getattr(tool_result, "content", None) or []:
+            try:
+                raw = json.loads(getattr(item, "text", ""))
+            except (TypeError, ValueError):
+                continue
+            break
+
+    error_info = raw.get("error") if isinstance(raw, dict) else None
+    not_found = isinstance(error_info, dict) and error_info.get("code") == "ticket_not_found"
+
+    if not_found:
+        return reply(f"I could not find a ticket {ticket_id}.", "ticket_not_found", calls)
+
+    if not isinstance(ticket, dict):
+        return reply(
+            f"I could not read ticket {ticket_id} right now.", "ticket_lookup_unavailable", calls
+        )
+
+    # Same answer for other people's tickets, so ticket IDs cannot be probed.
+    if str(ticket.get("requester_email", "")).strip().lower() != str(
+        employee.get("email", signed_in_email)
+    ).strip().lower():
+        return reply(
+            f"I can only show tickets raised by your own account, and I could "
+            f"not find {ticket_id} under it.",
+            "ticket_not_found",
+            calls,
+        )
+
+    lines = [
+        f"Ticket {ticket_id}: {_single_line(ticket.get('subject'), 120)}",
+        f"- Status: {_single_line(ticket.get('status'), 30)}",
+        f"- Priority: {_single_line(ticket.get('priority'), 10)}",
+        f"- Category: {_single_line(ticket.get('category'), 30)}",
+    ]
+    if ticket.get("assigned_team"):
+        lines.append(f"- Assigned team: {_single_line(ticket['assigned_team'], 60)}")
+    if ticket.get("resolution"):
+        lines.append(f"- Resolution: {_single_line(ticket['resolution'], 300)}")
+    notes = ticket.get("notes")
+    if isinstance(notes, list):
+        lines.append(f"- Notes on the ticket: {len(notes)}")
+
+    return reply("\n".join(lines), "ticket_status", calls)
+
+
+_MY_TICKETS_QUESTION = re.compile(
+    r"\b(?:my|mt|mine)\s+(?:\w+\s+){0,2}?(?:tickets|tikets|tickts|teckits|tickes)\b"
+    r"|\btickets?\s+(?:i|we)\s+(?:raised|opened|created|submitted|have)\b",
+    re.IGNORECASE,
+)
+
+
+async def _my_tickets_response(
+    message: str, signed_in_email: str | None
+) -> dict[str, Any] | None:
+    """List the signed-in employee's own tickets through the read-only search_tickets tool."""
+    if _TICKET_ID.search(message) or not _MY_TICKETS_QUESTION.search(
+        _unquoted_user_text(message)
+    ):
+        return None
+
+    def reply(text: str, state: str, calls: list[dict[str, Any]] | None = None):
+        return {
+            "reply": text,
+            "pending_action": None,
+            "citations": [],
+            "tool_calls": calls or [],
+            "result": {},
+            "state": state,
+        }
+
+    employee = None
+    if signed_in_email:
+        employee, _ = await _lookup_employee(signed_in_email)
+
+    if employee is None:
+        return reply(
+            "Please sign in with your work email first, so I can show only "
+            "the tickets raised by your own account.",
+            "ticket_lookup_requires_identity",
+        )
+
+    email = str(employee.get("email") or signed_in_email).strip().lower()
+    lines = await _recent_ticket_lines(email, limit=10)
+    calls = [{"tool": "search_tickets", "ok": bool(lines)}]
+
+    if not lines:
+        return reply(
+            "I could not find any tickets raised by your account right now.",
+            "my_tickets_empty",
+            calls,
+        )
+
+    return reply(
+        "Your tickets:\n" + "\n".join(f"- {line}" for line in lines),
+        "my_tickets",
+        calls,
+    )
 
 
 @app.get("/api/tickets", summary="List a verified requester's tickets (read-only)")
@@ -1407,15 +2133,42 @@ async def list_tickets(requester_email: str, limit: int = 50):
     }
 
 
+@app.post("/api/identify", summary="Verify a work email against the directory (read-only)")
+async def identify(request: IdentifyRequest):
+    """Lets a UI greet the employee by name. Identification only: it reads the
+    directory through the existing lookup tool and never creates or changes data."""
+
+    employee, error = await _lookup_employee(request.email)
+
+    if employee is None:
+        return {"verified": False, "message": error or "Employee not found."}
+
+    return {
+        "verified": True,
+        "email": employee["email"].strip().lower(),
+        "name": employee.get("name"),
+        "department": employee.get("department"),
+        "title": employee.get("title"),
+        "account_status": employee.get("account_status"),
+    }
+
+
 @app.post("/api/memory/forget", summary="Delete this session's saved memory")
 async def forget_memory(request: ForgetRequest):
-    """Deletes only the caller's own session memory; never touches tickets."""
+    """Deletes the caller's session memory and, for a directory-verified email,
+    that employee's saved facts, notes and past conversations; never touches tickets."""
 
     store = _memory_store()
+    owner: str | None = None
+
+    if request.email and request.email.strip():
+        employee, _ = await _lookup_employee(request.email)
+        if employee is not None:
+            owner = chat_memory.owner_key(employee["email"])
 
     if store is not None:
         try:
-            store.forget(request.session_id)
+            store.forget(request.session_id, owner)
         except chat_memory.ChatMemoryError:
             logger.exception("Chat memory could not be deleted")
             return {"state": "memory_delete_failed"}
@@ -1471,6 +2224,51 @@ async def chat(request: ChatRequest):
         }
 
     try:
+        if _asks_to_explain_quoted_ticket_instruction(request.message):
+            _clear_ticket_intake(request.session_id)
+            reply = (
+                "The quoted message is telling its recipient to create a "
+                "support ticket right away. Since you asked only for an "
+                "explanation, I have not created a ticket."
+            )
+            _remember_chat_turn(request.session_id, request.message, reply)
+            _remember_cited_documents(request.session_id, [])
+            return {
+                "reply": reply,
+                "pending_action": None,
+                "citations": [],
+                "tool_calls": [],
+                "result": {},
+            }
+
+        if (
+            not _requests_ticket_creation(request.message)
+            and _is_service_status_question(request.message)
+        ):
+            _clear_ticket_intake(request.session_id)
+            return await _live_service_status_response(request.message)
+
+        if not _requests_ticket_creation(request.message):
+            ticket_reply = await _ticket_lookup_response(
+                request.message,
+                request.user.email.strip().lower()
+                if request.user and request.user.email.strip()
+                else None,
+            )
+            if ticket_reply is None:
+                ticket_reply = await _my_tickets_response(
+                    request.message,
+                    request.user.email.strip().lower()
+                    if request.user and request.user.email.strip()
+                    else None,
+                )
+            if ticket_reply is not None:
+                _clear_ticket_intake(request.session_id)
+                _remember_chat_turn(
+                    request.session_id, request.message, ticket_reply["reply"]
+                )
+                return ticket_reply
+
         intake = _begin_or_continue_ticket_intake(request)
 
         verified_lookup: tuple[dict[str, Any] | None, str | None] | None = None
@@ -1480,19 +2278,93 @@ async def chat(request: ChatRequest):
             candidate_email = intake.requester_email or _email_from_message(
                 _unquoted_user_text(_ticket_report(intake.messages))
             )
-
-            if candidate_email:
-                verified_lookup = await _lookup_employee(candidate_email)
-                directory_department = (
-                    verified_lookup[0].get("department")
-                    if verified_lookup[0] is not None
-                    else None
+        else:
+            candidate_email = (
+                request.user.email.strip().lower()
+                if request.user and request.user.email.strip()
+                else _email_from_message(
+                    _unquoted_user_text(request.message)
                 )
+            )
 
-                if isinstance(directory_department, str):
-                    verified_department = directory_department
+        # Department exceptions also govern ordinary technical answers, not
+        # just ticket drafts. Resolve the submitted work email against the
+        # directory before passing a department to the grounded answer path.
+        if candidate_email:
+            verified_lookup = await _lookup_employee(candidate_email)
+            directory_department = (
+                verified_lookup[0].get("department")
+                if verified_lookup[0] is not None
+                else None
+            )
+
+            if isinstance(directory_department, str):
+                verified_department = directory_department
+
+        if intake is None and verified_department:
+            claimed_department = _claimed_department_in_message(request.message)
+            if (
+                claimed_department
+                and claimed_department.casefold()
+                != verified_department.casefold()
+            ):
+                reply = (
+                    f"Your message says you're a {claimed_department}, but the "
+                    f"verified work account for this chat is associated with "
+                    f"{verified_department}. Are you asking on behalf of someone "
+                    "in a different department, or should we check a different "
+                    "work account? I won't apply a department-specific policy "
+                    "until this is clarified."
+                )
+                _remember_chat_turn(request.session_id, request.message, reply)
+                _remember_cited_documents(request.session_id, [])
+                return {
+                    "reply": reply,
+                    "pending_action": None,
+                    "citations": [],
+                    "tool_calls": [],
+                    "result": {},
+                    "state": "identity_clarification_required",
+                }
 
         agent_kwargs: dict[str, Any] = {}
+
+        # Long-term memory follows only the signed-in, directory-verified
+        # employee, never an address merely mentioned in the message text.
+        memory_owner: str | None = None
+
+        if (
+            request.user
+            and request.user.email.strip()
+            and verified_lookup is not None
+            and verified_lookup[0] is not None
+            and candidate_email == request.user.email.strip().lower()
+        ):
+            memory_owner = chat_memory.owner_key(candidate_email)
+
+        if (
+            intake is None
+            and memory_owner
+            and verified_lookup is not None
+            and verified_lookup[0] is not None
+            and _WHO_AM_I.search(_unquoted_user_text(request.message))
+        ):
+            employee = verified_lookup[0]
+            name = _single_line(employee.get("name") or employee.get("full_name"), 80)
+            if name:
+                reply = (
+                    f"You are signed in as {name} ({candidate_email})"
+                    + (f", {verified_department}." if verified_department else ".")
+                )
+                _remember_chat_turn(request.session_id, request.message, reply)
+                return {
+                    "reply": reply,
+                    "pending_action": None,
+                    "citations": [],
+                    "tool_calls": [{"tool": "lookup_employee", "ok": True}],
+                    "result": {},
+                    "state": "who_am_i",
+                }
 
         if verified_department:
             agent_kwargs["department"] = verified_department
@@ -1505,7 +2377,16 @@ async def chat(request: ChatRequest):
         else:
             agent_result = await run_agent(
                 message=request.message,
-                history=_chat_history(request.session_id, request.message),
+                history=_chat_history(
+                    request.session_id,
+                    request.message,
+                    memory_owner,
+                    await _recent_ticket_lines(candidate_email)
+                    if memory_owner
+                    and candidate_email
+                    and _RECURRENCE_HINT.search(request.message)
+                    else [],
+                ),
                 **agent_kwargs,
             )
 
@@ -1533,7 +2414,11 @@ async def chat(request: ChatRequest):
             agent_result.get("answer", ""),
         )
         _remember_chat_turn(
-            request.session_id, request.message, final_reply, citations
+            request.session_id,
+            request.message,
+            final_reply,
+            citations,
+            memory_owner,
         )
         _remember_cited_documents(request.session_id, citations)
 
@@ -1897,6 +2782,20 @@ async def _draft_ticket_response(
                 "state": "requester_unverified",
             }
 
+        if _requester_identity_conflicts(intake, request, employee):
+            return {
+                "reply": (
+                    "The requester details in this conversation do not match "
+                    "the verified employee record. No draft was prepared. "
+                    f"{WORK_EMAIL_PROMPT}"
+                ),
+                "pending_action": None,
+                "citations": citations,
+                "tool_calls": tool_calls,
+                "result": {},
+                "state": "requester_identity_mismatch",
+            }
+
         if (
             department_value == "Contractors"
             and service == "vpn"
@@ -1964,7 +2863,10 @@ async def _draft_ticket_response(
 
     if not attempted_steps and employee is not None:
         direct = _kb_direct_escalation_step(
-            facts, str(employee.get("department") or ""), service
+            facts,
+            str(employee.get("department") or ""),
+            service,
+            status_checked=status_page is not None,
         )
 
         if direct is not None:
@@ -2002,7 +2904,6 @@ async def _draft_ticket_response(
     department: str | None = None
     category: str | None = None
     priority: str | None = None
-    priority_note = ""
     if employee is not None:
         department_value = employee.get("department")
         departments = TICKET_SCHEMA.get("$defs", {}).get(
@@ -2025,20 +2926,25 @@ async def _draft_ticket_response(
                 department,
                 affected_users,
             )
-            if priority is None and attempted_steps:
-                # Nothing reported suggests a block or a wide impact: standard
-                # P3; the requester sees and approves it in the draft.
-                priority = "P3"
-                priority_note = (
-                    "Priority P3 is the standard level because no blocking "
-                    "impact or user count was reported."
-                )
-            elif priority is None:
+            if priority is None:
                 missing.append(
-                    "the impact: how many people are affected, and whether "
-                    "work is completely blocked without a workaround or a "
-                    "workaround is available"
+                    "the impact required by KB-015: how many people are "
+                    "affected, and whether work is completely blocked with "
+                    "no workaround or a workaround exists"
                 )
+            for reference in _classification_kb_refs(
+                category,
+                priority,
+                department,
+                facts,
+            ):
+                if reference not in kb_refs:
+                    kb_refs.append(reference)
+
+    if len(kb_refs) > 10:
+        missing.append(
+            "no more than 10 relevant knowledge-base references"
+        )
 
     if employee_error:
         return {
@@ -2130,7 +3036,6 @@ async def _draft_ticket_response(
         f"Subject: {subject}\n"
         f"Category: {category}\n"
         f"Priority: {priority}\n"
-        + (f"{priority_note}\n" if priority_note else "")
         + f"Requester: {requester_email} ({department})\n"
         f"Attempted steps: {step_summary}\n"
         f"KB references: {', '.join(payload['kb_refs']) or 'none'}\n"

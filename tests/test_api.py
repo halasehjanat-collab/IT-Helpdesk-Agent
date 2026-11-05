@@ -6,11 +6,11 @@ import pytest
 from mcp.types import CallToolResult, TextContent
 
 import app as app_module
-from tests.conftest import VALID_PAYLOAD, ticket_result
 from services.local_ticket_store import (
     TicketStoreError,
     payload_digest,
 )
+from tests.conftest import VALID_PAYLOAD, ticket_result
 
 CHAT_FIELDS = {"reply", "pending_action", "citations", "tool_calls", "result"}
 
@@ -363,6 +363,144 @@ def test_ordinary_it_question_does_not_create_pending_ticket(
     fake_mcp.create_approved_ticket.assert_not_called()
 
 
+def test_ordinary_chat_uses_directory_verified_department(
+    client, fake_mcp, monkeypatch
+):
+    email = "fadi.mansour@nakhla.example"
+
+    async def finance_directory(name, arguments=None):
+        if name == "lookup_employee":
+            assert arguments["email"] == email
+            return CallToolResult(
+                content=[],
+                structuredContent={
+                    "ok": True,
+                    "employee": {"email": email, "department": "Finance"},
+                },
+                isError=False,
+            )
+        return await fake_mcp._read_tool(name, arguments)
+
+    fake_mcp.call_tool.side_effect = finance_directory
+    agent_call = AsyncMock(
+        return_value={
+            "reply": "Finance users should contact Security Operations [KB-016].",
+            "citations": [],
+            "tool_calls": [],
+            "pending_action": None,
+        }
+    )
+    monkeypatch.setattr(app_module, "run_agent", agent_call)
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "session_id": "ordinary-finance",
+            "message": "NakhlaConnect shows NX-403. What should I do?",
+            "user": {"email": email},
+        },
+    )
+
+    assert response.status_code == 200
+    assert agent_call.await_args.kwargs["department"] == "Finance"
+    fake_mcp.call_tool.assert_awaited_once()
+    fake_mcp.create_approved_ticket.assert_not_called()
+
+
+def test_ordinary_chat_resolves_email_typed_in_message_against_directory(
+    client, fake_mcp, monkeypatch
+):
+    agent_call = AsyncMock(
+        return_value={
+            "reply": "I can help with the VPN issue.",
+            "citations": [],
+            "tool_calls": [],
+            "pending_action": None,
+        }
+    )
+    monkeypatch.setattr(app_module, "run_agent", agent_call)
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "session_id": "typed-email",
+            "message": (
+                "tariq.hamdan@nakhla.example in Finance. "
+                "NakhlaConnect shows NX403."
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    fake_mcp.call_tool.assert_awaited_once()
+    assert agent_call.await_args.kwargs["department"] == "Engineering"
+    fake_mcp.create_approved_ticket.assert_not_called()
+
+
+def test_ticket_subject_skips_department_only_preface():
+    subject = app_module._ticket_subject(
+        "I'm in Finance. NakhlaConnect shows NX-403 when I connect from home. "
+        "If it needs a ticket, prepare it for me."
+    )
+
+    assert "NakhlaConnect" in subject
+    assert "NX-403" in subject
+    assert "Finance" not in subject
+
+
+def test_finance_vpn_draft_uses_issue_subject_and_truthful_direct_handling(
+    client, fake_mcp, monkeypatch
+):
+    email = "fadi.mansour@nakhla.example"
+
+    async def finance_tools(name, arguments=None):
+        if name == "lookup_employee":
+            return CallToolResult(
+                content=[],
+                structuredContent={
+                    "ok": True,
+                    "employee": {"email": email, "department": "Finance"},
+                },
+                isError=False,
+            )
+        if name == "get_service_status":
+            return CallToolResult(
+                content=[],
+                structuredContent={
+                    "ok": True,
+                    "status": {"services": [], "incidents": []},
+                },
+                isError=False,
+            )
+        return await fake_mcp._read_tool(name, arguments)
+
+    fake_mcp.call_tool.side_effect = finance_tools
+    response = client.post(
+        "/api/chat",
+        json={
+            "session_id": "finance-nx403-draft",
+            "message": (
+                "I'm in Finance. NakhlaConnect shows NX-403 when I connect "
+                "from home. I am the only affected user, my work is "
+                "completely blocked, and I have no workaround. If it "
+                "needs a ticket, prepare it for me."
+            ),
+            "user": {"email": email},
+        },
+    )
+
+    body = response.json()
+    payload = body["pending_action"]["payload"]
+    assert payload["category"] == "security"
+    assert payload["department"] == "Finance"
+    assert "NX-403" in payload["subject"]
+    assert "Finance" not in payload["subject"]
+    assert "Checked the service status" in payload["attempted_steps"][0]
+    assert "No client troubleshooting was performed" in payload["attempted_steps"][0]
+    assert payload["kb_refs"] == ["KB-016", "KB-015"]
+    assert fake_mcp.create_approved_ticket.await_count == 0
+
+
 def test_agent_result_cannot_inject_a_pending_ticket_action(
     client, fake_mcp, monkeypatch
 ):
@@ -520,6 +658,83 @@ def test_ticket_intake_accepts_follow_up_without_repeating_request(
         follow_up["pending_action"]["payload"]
     ) == []
     fake_mcp.create_approved_ticket.assert_not_called()
+
+
+def test_escalate_command_keeps_issue_context_and_reaches_approved_draft(
+    client, fake_mcp, monkeypatch, clean_chat_history
+):
+    _stub_agent(monkeypatch)
+    session = "escalate-context"
+
+    client.post(
+        "/api/chat",
+        json={
+            "session_id": session,
+            "message": (
+                'Hi, I cannot connect to the company VPN. '
+                'It keeps saying "Connection failed." I am the only affected '
+                'user, completely blocked from working, with no workaround.'
+            ),
+        },
+    )
+    client.post(
+        "/api/chat",
+        json={"session_id": session, "message": "NX403"},
+    )
+    intake = client.post(
+        "/api/chat",
+        json={"session_id": session, "message": "escalate date"},
+    ).json()
+
+    assert intake["state"] == "ticket_info_required"
+    assert "work email" in intake["reply"]
+
+    employee = client.post(
+        "/api/chat",
+        json={
+            "session_id": session,
+            "message": "tariq.hamdan@nakhla.example in Engineering",
+        },
+    ).json()
+    assert employee["state"] == "ticket_info_required"
+    assert "troubleshooting step you actually tried" in employee["reply"]
+    intake_messages = app_module.app.state.ticket_intakes[session].messages
+    assert any("company VPN" in item for item in intake_messages)
+    assert any("NX403" in item for item in intake_messages)
+    assert app_module._ticket_priority(
+        app_module._ticket_report(intake_messages), "Engineering", 1
+    ) == "P2"
+
+    draft_response = client.post(
+        "/api/chat",
+        json={
+            "session_id": session,
+            "message": "I tried to connect and failed.",
+        },
+    ).json()
+
+    assert draft_response["state"] == "ticket_draft_pending"
+    payload = draft_response["pending_action"]["payload"]
+    assert payload["category"] == "network_access"
+    assert payload["priority"] == "P2"
+    assert payload["department"] == "Engineering"  # directory wins over the claim
+    assert "NX-403" in payload["subject"]
+    assert payload["attempted_steps"] == ["connect and failed"]
+    assert "no ticket has been created" in draft_response["reply"].lower()
+    fake_mcp.create_approved_ticket.assert_not_called()
+
+    result = approve(
+        client,
+        session,
+        draft_response["pending_action"]["action_id"],
+        True,
+    ).json()
+    assert result["state"] == "ticket_created"
+    assert fake_mcp.create_approved_ticket.await_count == 1
+
+
+def test_how_to_escalation_question_does_not_start_ticket_intake():
+    assert not app_module._requests_ticket_creation("How do I escalate a VPN issue?")
 
 
 def test_unverified_employee_cannot_receive_ticket_draft(

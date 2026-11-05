@@ -151,6 +151,19 @@ def test_finance_is_never_walked_through_a_client_update(monkeypatch):
     assert "Security Operations" in result["reply"]
 
 
+def test_finance_nx112_does_not_receive_general_sync_instructions(monkeypatch):
+    result = ask(
+        "NX-112 means the device certificate is missing. Open NakhlaManage > "
+        "Sync, restart the laptop, then check that it is compliant. [KB-002]",
+        "Finance VPN problem, error NX-112",
+        "Finance",
+        monkeypatch,
+    )
+
+    assert "NakhlaManage > Sync" not in result["reply"]
+    assert "Security Operations" in result["reply"]
+
+
 def test_finance_nx403_does_not_get_general_nakhlaid_troubleshooting(monkeypatch):
     result = ask(
         "Approve the NakhlaKey prompt within 60 seconds [KB-002].",
@@ -243,7 +256,9 @@ def test_executive_office_is_always_p1():
 
 
 def test_finance_vpn_is_security_p2_and_p1_above_three_users():
-    text = "VPN will not connect and I am completely blocked"
+    text = (
+        "VPN will not connect and I am completely blocked with no workaround"
+    )
 
     assert app_module._ticket_category(text, "Finance") == "security"
     assert app_module._ticket_priority(text, "Finance", None) == "P2"
@@ -251,12 +266,15 @@ def test_finance_vpn_is_security_p2_and_p1_above_three_users():
 
 
 def test_vpn_exceptions_do_not_leak_to_other_departments():
-    text = "VPN will not connect and I am completely blocked"
+    text = (
+        "VPN will not connect and I am completely blocked with no workaround"
+    )
 
     for department in ("Engineering", "HR", "Contractors"):
         assert app_module._ticket_category(text, department) == "network_access"
 
-    assert app_module._ticket_priority(text, "Engineering", None) == "P2"
+    assert app_module._ticket_priority(text, "Engineering", None) is None
+    assert app_module._ticket_priority(text, "Engineering", 1) == "P2"
     assert app_module._ticket_priority("my mouse is broken", "HR", None) is None
 
 
@@ -326,7 +344,7 @@ def test_deprecated_version_claim_is_not_supported(monkeypatch):
 
 # --- F. unsupported and unrelated questions ----------------------------------
 
-def test_slow_computer_has_no_eligible_kb_and_gets_honest_fallback(monkeypatch):
+def test_slow_computer_has_no_eligible_kb_and_asks_for_details(monkeypatch):
     found = {
         str(c.metadata.get("id"))
         for c in kb_retriever.retrieve_chunks("my computer is very slow", 5)
@@ -342,7 +360,8 @@ def test_slow_computer_has_no_eligible_kb_and_gets_honest_fallback(monkeypatch):
     )
 
     assert "defragment" not in result["reply"]
-    assert result["reply"].startswith("I couldn't verify")
+    assert "when opening apps" in result["reply"]
+    assert "When did it start" in result["reply"]
 
 
 # --- G. injection and approval gate (mocked writer) --------------------------

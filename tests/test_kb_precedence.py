@@ -369,6 +369,12 @@ def test_error_code_lookup_returns_only_eligible_documents():
     assert kp.error_code_documents("ZZ-999 unknown, plain words") == {}
 
 
+def test_error_code_lookup_accepts_code_without_separator():
+    assert kp.error_code_documents("The VPN displays NX403") == {
+        "NX-403": ("KB-002",),
+    }
+
+
 def test_error_code_mapped_only_to_ineligible_documents_is_ignored():
     manifest = copy.deepcopy(MANIFEST)
     manifest["error_code_index"]["OLD-100"] = ["KB-001"]
@@ -534,11 +540,11 @@ def agent_spy(monkeypatch):
     return spy
 
 
-def test_ordinary_question_passes_no_department_and_does_no_lookup(client, fake_mcp, agent_spy):
+def test_ordinary_question_uses_verified_directory_department(client, fake_mcp, agent_spy):
     response = chat(client, "How do I fix NX-781?")
     assert response.status_code == 200 and response.json()["pending_action"] is None
-    assert "department" not in agent_spy.await_args.kwargs
-    assert lookups(fake_mcp) == []
+    assert agent_spy.await_args.kwargs["department"] == "Engineering"
+    assert len(lookups(fake_mcp)) == 1
 
 
 def test_ticket_request_uses_the_directory_department_and_one_lookup(client, fake_mcp, agent_spy):
@@ -551,16 +557,17 @@ def test_ticket_request_uses_the_directory_department_and_one_lookup(client, fak
     fake_mcp.create_approved_ticket.assert_not_called()
 
 
-def test_department_claimed_by_the_user_is_not_trusted(client, fake_mcp, agent_spy):
+def test_department_claim_conflicting_with_directory_is_rejected(
+    client, fake_mcp, agent_spy
+):
     body = chat(
         client,
         "I work in Finance. I tried restarting the VPN client. Please create a ticket for VPN error NX-781.",
     ).json()
     agent_spy.assert_not_awaited()
-    # The directory says Engineering, so the Finance-only KB-016 shortcut must not apply.
-    assert body["state"] == "ticket_draft_pending"
-    assert body["pending_action"]["payload"]["department"] == "Engineering"
-    assert "KB-016" not in str(body["pending_action"]["payload"])
+    assert body["state"] == "requester_identity_mismatch"
+    assert body["pending_action"] is None
+    fake_mcp.create_approved_ticket.assert_not_called()
 
 
 def test_failed_directory_lookup_applies_no_department(client, fake_mcp, agent_spy):

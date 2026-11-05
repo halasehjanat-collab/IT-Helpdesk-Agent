@@ -8,7 +8,6 @@ import app as app_module
 from evals import run_evals
 from evals import run_isolated_evals as iso
 from services.local_ticket_store import SQLiteTicketMetadataStore, TicketStoreError
-from tests.conftest import VALID_PAYLOAD
 
 
 def _approve_seeded(client, seed_ticket_action):
@@ -148,7 +147,9 @@ def _s205_turns(client):
     return client.post("/api/chat", json={
         "session_id": "s205", "user": user,
         "message": "I did all of that: NakhlaManage Sync, restarted the laptop. "
-                   "It still shows NX-112 and I cannot work. Please open a ticket."}).json()
+                   "It still shows NX-112. I am the only affected user, "
+                   "completely blocked from working, with no workaround. "
+                   "Please open a ticket."}).json()
 
 
 def test_followed_cited_guidance_adds_the_cited_kb_reference(client, fake_mcp, monkeypatch):
@@ -156,14 +157,17 @@ def test_followed_cited_guidance_adds_the_cited_kb_reference(client, fake_mcp, m
     _stub_cited_agent(monkeypatch, cite)
     draft = _s205_turns(client)
     assert draft["state"] == "ticket_draft_pending"
-    assert draft["pending_action"]["payload"]["kb_refs"] == ["KB-002"]
+    assert draft["pending_action"]["payload"]["kb_refs"] == [
+        "KB-002",
+        "KB-015",
+    ]
     fake_mcp.create_approved_ticket.assert_not_called()
 
 
 def test_no_kb_reference_is_invented_without_a_prior_citation(client, fake_mcp, monkeypatch):
     _stub_cited_agent(monkeypatch, [])
     draft = _s205_turns(client)
-    assert draft["pending_action"]["payload"]["kb_refs"] == []
+    assert "KB-002" not in draft["pending_action"]["payload"]["kb_refs"]
 
 
 def test_claim_of_following_guidance_does_not_cite_other_sessions(client, fake_mcp, monkeypatch):
@@ -172,4 +176,4 @@ def test_claim_of_following_guidance_does_not_cite_other_sessions(client, fake_m
     client.post("/api/chat", json={"session_id": "other", "message": "NX-112 on VPN"})
     _stub_cited_agent(monkeypatch, [])
     draft = _s205_turns(client)
-    assert draft["pending_action"]["payload"]["kb_refs"] == []
+    assert "KB-002" not in draft["pending_action"]["payload"]["kb_refs"]

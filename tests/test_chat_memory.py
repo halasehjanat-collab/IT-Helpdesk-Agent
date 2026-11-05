@@ -5,8 +5,8 @@ import pytest
 
 import app as app_module
 from services import chat_memory
-from services.chat_memory import ChatMemoryStore
 from services.answer_verifier import ABSTENTION, PARTIAL_NOTE
+from services.chat_memory import ChatMemoryStore
 
 CITED = [{"id": "KB-002", "title": "VPN"}]
 VPN_REPLY = "Open the Nakhla VPN client and choose Reset Profile [KB-002]."

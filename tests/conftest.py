@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import app as app_module  # noqa: E402
-from services.approval_store import SQLiteApprovalStore  # noqa: E402
-from services.local_ticket_store import SQLiteTicketMetadataStore  # noqa: E402
+import app as app_module
+from services.approval_store import SQLiteApprovalStore
+from services.local_ticket_store import SQLiteTicketMetadataStore
 
 VALID_PAYLOAD = {
     "subject": "VPN error NX-781 on login",

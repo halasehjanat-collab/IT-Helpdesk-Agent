@@ -106,3 +106,31 @@ def _accepts_three():
     import inspect
 
     return len(inspect.signature(av.verify_answer).parameters) >= 2
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        ("Can I talk to you?", "Of course"),
+        ("I just want to chat", "Of course"),
+        ("\u0628\u062f\u064a \u0627\u062d\u0643\u064a \u0645\u0639\u0643 \u0644\u0648 \u0633\u0645\u062d\u062a", "\u0623\u0643\u064a\u062f"),
+        ("\u0644\u0648 \u0633\u0645\u062d\u062a \u0628\u062f\u064a \u0627\u062d\u0643\u064a \u0645\u0639\u0643 \u0627\u0648 \u0633\u0627\u0639\u062f\u0646\u064a \u062d\u0643\u064a \u0645\u0627 \u0627\u0644\u0648 \u0628\u0642\u0627\u0639\u062f\u0629 \u0627\u0644\u0628\u064a\u0627\u0646\u0627\u062a", "\u0623\u0643\u064a\u062f"),
+    ],
+)
+def test_social_conversation_bid_gets_natural_reply_without_backends(
+    no_backends, msg, expected
+):
+    result = _run(msg)
+    assert expected in result["reply"]
+    assert result["citations"] == []
+    assert result["tool_calls"] == []
+    assert result["pending_action"] is None
+    assert no_backends == {"retrieve": 0, "llm": 0}
+
+
+def test_social_bid_with_it_issue_stays_on_grounded_support_path():
+    assert agent._small_talk_reply("Can I talk to you about my VPN?") is None
+    assert agent._small_talk_reply("\u0628\u062f\u064a \u0627\u062d\u0643\u064a \u0645\u0639\u0643 \u0639\u0646 \u0645\u0634\u0643\u0644\u0629 VPN") is None
+
+
+def test_arabic_greeting_is_recognized():
+    assert agent._small_talk_reply("\u0645\u0631\u062d\u0628\u0627") is not None

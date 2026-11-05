@@ -17,12 +17,16 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-from services.helpdesk_ticket_db import TicketDatabase, TicketDatabaseError, configured_ticket_db_path
+from services.helpdesk_ticket_db import (
+    TicketDatabase,
+    TicketDatabaseError,
+    configured_ticket_db_path,
+)
 
 KIT = Path(__file__).resolve().parent.parent
 EXPORT_FORMAT = "helpdesk-ticket-history-export-v1"
@@ -63,7 +67,7 @@ def build_export(database: TicketDatabase, *, include_archive: bool = False) -> 
 
     return {
         "format": EXPORT_FORMAT,
-        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "exported_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "includes_archive": include_archive,
         "ticket_count": len(tickets),
         "tickets": tickets,

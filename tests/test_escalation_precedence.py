@@ -7,7 +7,11 @@ import pytest
 import app as app_module
 from services.chat_memory import ChatMemoryStore
 
-VPN_REPORT = "I cannot connect to the VPN. I restarted my laptop, but the problem persists."
+VPN_REPORT = (
+    "I cannot connect to the VPN. I restarted my laptop, but the problem "
+    "persists. I am the only affected user, completely blocked from working, "
+    "with no workaround."
+)
 TROUBLESHOOTING_QUESTION = (
     "Which error code does NakhlaConnect show, and which department are you in?"
 )

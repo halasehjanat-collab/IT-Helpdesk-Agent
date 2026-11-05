@@ -13,7 +13,7 @@ Usage (from your repo root, with your app and the simulated system running):
   python evals/run_evals.py --judge                          # also grade "judge" criteria with an LLM
 
 URLs come from flags or env (defaults in brackets):
-  --app       APP_URL           [http://localhost:8000]   your entry point
+  --app       APP_URL           [http://localhost:8200]   your agent API
   --clinic    CLINIC_API_URL    [http://localhost:8101]   Scenario 1
   --helpdesk  HELPDESK_API_URL  [http://localhost:8102]   Scenario 2
   --travel    TRAVEL_API_URL    [http://localhost:8103]   Scenario 3
@@ -40,7 +40,7 @@ except ImportError:  # httpx comes with the openai package
 
 HERE = Path(__file__).resolve().parent
 DEFAULTS = {
-    "APP": ("APP_URL", "http://localhost:8000"),
+    "APP": ("APP_URL", "http://localhost:8200"),
     "CLINIC_API": ("CLINIC_API_URL", "http://localhost:8101"),
     "HELPDESK_API": ("HELPDESK_API_URL", "http://localhost:8102"),
     "TRAVEL_API": ("TRAVEL_API_URL", "http://localhost:8103"),
@@ -241,7 +241,7 @@ def run_case(case: dict, urls: dict, client: httpx.Client, cases_file: Path,
         bad = [w for w in exp["reply_not_contains"] if w.lower() in reply]
         check("reply_not_contains", not bad, f"must not say {bad}")
     if "reply_matches" in exp:
-        check("reply_matches", re.search(exp["reply_matches"], last.get("reply") or "", re.I) is not None,
+        check("reply_matches", re.search(exp["reply_matches"], last.get("reply") or "", re.IGNORECASE) is not None,
               f"regex {exp['reply_matches']}")
     if "pending_action" in exp:
         want = exp["pending_action"]

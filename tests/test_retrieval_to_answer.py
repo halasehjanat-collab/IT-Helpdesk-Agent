@@ -67,6 +67,68 @@ def test_error_code_finds_its_document():
     assert "KB-006" in retrieved_ids("NakhlaID says NID-423 when I try to sign in.")
 
 
+def test_error_code_without_hyphen_still_retrieves_its_indexed_source():
+    assert "KB-002" in retrieved_ids("NX403")
+
+
+def test_unhyphenated_nx403_reaches_generator_with_its_code_specific_kb_row(model):
+    seen = model(
+        "NX-403 means access denied. [KB-002] Approve the NakhlaKey prompt "
+        "within 60 seconds. [KB-002] Check you are enrolled in NakhlaKey. "
+        "[KB-002]"
+    )
+    result = ask("NX403")
+
+    vpn_evidence = [
+        document["text"]
+        for document in seen["documents"]
+        if document["id"] == "KB-002"
+    ]
+    assert any("NX-403" in passage and "Access denied" in passage for passage in vpn_evidence)
+    assert any("NakhlaKey" in passage for passage in vpn_evidence)
+    verified = answer_verifier.verify_answer(
+        "NX-403 means access denied. [KB-002] Approve the NakhlaKey prompt "
+        "within 60 seconds. [KB-002] Check you are enrolled in NakhlaKey. "
+        "[KB-002]",
+        seen["documents"],
+        message="NX403",
+    )
+    assert verified.status != "abstained", verified.claims
+    assert "NakhlaKey" in result["reply"], (
+        verified.status,
+        [(claim.text, claim.verdict, claim.reasons, claim.sources) for claim in verified.claims],
+        vpn_evidence,
+    )
+    assert "5.4.2" not in result["reply"]
+    assert [citation["id"] for citation in result["citations"]] == ["KB-002"]
+
+
+def test_short_error_code_follow_up_retrieves_from_recent_issue_context(
+    model, monkeypatch
+):
+    seen = model("NX-403 means access denied. [KB-002]")
+    queries = []
+    real_retrieve = agent_module.retrieve_chunks
+
+    def capture(query, top_k, **kwargs):
+        queries.append(query)
+        return real_retrieve(query, top_k, **kwargs)
+
+    monkeypatch.setattr(agent_module, "retrieve_chunks", capture)
+    result = ask(
+        "NX403",
+        history=[
+            {"role": "user", "content": "I cannot connect to the company VPN."},
+            {"role": "assistant", "content": "Which code is shown?"},
+        ],
+    )
+
+    assert "VPN" in queries[0]
+    assert "NX-403" in queries[0]
+    assert "KB-002" in {document["id"] for document in seen["documents"]}
+    assert "access denied" in result["reply"].lower()
+
+
 # --- A/B: substantive, cited answers for different documents ----------------
 
 def test_vpn_error_gets_a_cited_answer(model):
@@ -80,6 +142,58 @@ def test_vpn_error_gets_a_cited_answer(model):
     assert "GW-2" in result["reply"]
     assert answer_verifier.ABSTENTION not in result["reply"]
     assert [c["id"] for c in result["citations"]] == ["KB-002"]
+
+
+def test_wifi_connection_question_uses_office_wifi_guidance(model):
+    seen = model("Check the status page first. [KB-002]")
+    result = ask("I can't connect to the office Wi-Fi on my laptop. What should I try?")
+
+    assert "KB-003" in {document["id"] for document in seen["documents"]}
+    assert "Forget Nakhla-Corp" in result["reply"]
+    assert "NakhlaManage > Sync" in result["reply"]
+    assert "wired dock" in result["reply"]
+    assert "status page" not in result["reply"].lower()
+    assert [citation["id"] for citation in result["citations"]] == ["KB-003"]
+
+
+def test_wlan17_answer_includes_the_verified_device_compliance_step(model):
+    seen = model("Check the status page first. [KB-002]")
+    result = ask(
+        "I can\u2019t connect to office Wi-Fi and see error WLAN-17. What should I do?"
+    )
+
+    assert {"KB-003", "KB-010"} <= {
+        document["id"] for document in seen["documents"]
+    }
+    assert "fix the compliance problem shown in NakhlaManage" in result["reply"]
+    assert "NakhlaManage > Sync" in result["reply"]
+    assert "[KB-010]" in result["reply"]
+    assert {citation["id"] for citation in result["citations"]} >= {
+        "KB-003",
+        "KB-010",
+    }
+
+
+def test_nx781_gets_specific_fix_without_verified_department(model):
+    model("Check the status page first. [KB-002]")
+    result = ask("My app shows error NX-781. How can I fix it?")
+
+    assert "Update to 5.4.2 from Software Center" in result["reply"]
+    assert "restart NakhlaConnect" in result["reply"]
+    assert "status page" not in result["reply"].lower()
+    assert [citation["id"] for citation in result["citations"]] == ["KB-002"]
+
+
+def test_mfa_policy_conflict_question_gets_current_policy_answer(model):
+    model(answer_verifier.ABSTENTION)
+    result = ask(
+        "An old guide says to disable MFA, but the current security policy "
+        "says never to disable it. Which should I follow?"
+    )
+
+    assert "MFA is mandatory" in result["reply"]
+    assert "SP-002 overrides any knowledge-base article" in result["reply"]
+    assert "SP-002" in {citation["id"] for citation in result["citations"]}
 
 
 def test_a_different_topic_gets_its_own_cited_answer(model):
@@ -293,7 +407,8 @@ def test_followed_kb_guidance_is_carried_into_approved_ticket(
             "message": (
                 "I did all of that: NakhlaManage Sync, restarted the laptop, and "
                 "NakhlaManage says the laptop is compliant. It still shows NX-112 "
-                "and I cannot work. Please open a ticket."
+                "and I am the only affected user, completely blocked from "
+                "working with no workaround. Please open a ticket."
             ),
             "user": {"email": "sara.mikhail@nakhla.example"},
         },
@@ -329,6 +444,47 @@ def test_citations_come_only_from_retrieved_sources(model):
     result = ask("My VPN shows NX-503, what should I do?")
 
     assert [c["id"] for c in result["citations"]] == ["KB-002"]
+
+
+def test_nx781_answer_restores_omitted_minimum_from_verified_kb002(model):
+    seen = model(
+        "NX-781 means the client version is below the minimum. [KB-002] "
+        "Install NakhlaConnect from Software Center, then restart it. [KB-002]"
+    )
+    result = ask(
+        "NakhlaConnect shows NX-781 when I connect from home. I have version "
+        "5.1 and the VPN guide says 4.8 or later is supported, so what is wrong?",
+        department="Engineering",
+    )
+
+    retrieved = {document["id"] for document in seen["documents"]}
+    assert "KB-002" in retrieved
+    assert "KB-001" not in retrieved
+    assert "KB-018" not in retrieved
+    assert "minimum supported client version is 5.4" in result["reply"].lower()
+    assert "update to 5.4.2 from software center" in result["reply"].lower()
+    assert "[KB-002]" in result["reply"]
+    assert [citation["id"] for citation in result["citations"]] == ["KB-002"]
+
+
+def test_nx112_answer_restores_omitted_steps_from_verified_kb002(model):
+    seen = model(
+        "NX-112 means the device certificate is missing or expired. [KB-002] "
+        "Restart the laptop. [KB-002]"
+    )
+    result = ask(
+        "My NakhlaConnect VPN shows NX-112 since this morning.",
+        department="Support",
+    )
+
+    assert "KB-002" in {document["id"] for document in seen["documents"]}
+    assert "NakhlaManage > Sync" in result["reply"]
+    assert "restart the laptop" in result["reply"].lower()
+    assert "device is compliant" in result["reply"].lower()
+    assert result["reply"].lower().count("restart the laptop") == 1
+    assert result["reply"].lower().count("device is compliant") == 1
+    assert "[KB-002]" in result["reply"]
+    assert "KB-002" in [citation["id"] for citation in result["citations"]]
 
 
 def test_old_not_verified_section_in_history_is_not_repeated():
